@@ -1,0 +1,31 @@
+# Local media and catalog data
+本地视频库/
+下载的视频/
+AI交接说明.md
+
+# Local secrets and runtime configuration
+**/web_config.json
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-wal
+*.db-shm
+
+# Logs, generated reports and exports
+**/操作日志.jsonl
+**/操作记录/
+**/报告/
+**/索引/
+**/待导入/
+**/虚拟回收站/
+**/*导出*.csv
+**/*导出*.json
+**/*.pyc
+__pycache__/
+
+# Local editor and OS files
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

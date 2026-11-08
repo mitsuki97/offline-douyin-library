@@ -1,0 +1,173 @@
+from __future__ import annotations
+import base64, hashlib, json, os, secrets, shutil, sqlite3, threading, time
+import re, unicodedata
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+BASE = Path(__file__).resolve().parent.parent
+LIB = BASE / '本地视频库'
+DB = LIB / '索引' / 'library.sqlite3'
+CONFIG = LIB / '索引' / 'web_config.json'
+HOST = os.environ.get('DOUYIN_HOST', '0.0.0.0')
+PORT = int(os.environ.get('DOUYIN_PORT', '8765'))
+
+def load_config():
+    CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    if CONFIG.exists():
+        return json.loads(CONFIG.read_text(encoding='utf-8'))
+    cfg = {'management_password': secrets.token_urlsafe(12), 'created_at': time.strftime('%Y-%m-%dT%H:%M:%S%z')}
+    CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding='utf-8')
+    return cfg
+
+CFG = load_config()
+SESSIONS = {}
+LOCK = threading.Lock()
+
+def db():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+def rows(c, sql, args=()): return [dict(x) for x in c.execute(sql, args)]
+def normalize_creator(name):
+    s=unicodedata.normalize('NFKC',str(name or '')).strip().lower()
+    s=re.sub(r'[\s\u3000]+','',s)
+    s=re.sub(r'[·•●★☆_\-—~～]+','',s)
+    return s
+
+def safe_path(p):
+    p = Path(p).resolve()
+    return p if p.is_relative_to(LIB.resolve()) else None
+
+INDEX = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>本地抖音工作台</title>
+<style>body{margin:0;font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif;background:#f5f6fa;color:#202535}header{background:#181b27;color:white;padding:14px 22px;display:flex;justify-content:space-between;align-items:center}main{max-width:1400px;margin:auto;padding:18px}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.tabs button,button{border:0;border-radius:8px;padding:9px 13px;cursor:pointer;background:#e6eaf3}.tabs button.active,button.primary{background:#315bdc;color:#fff}.panel{background:#fff;border:1px solid #e0e4ed;border-radius:12px;padding:16px;margin-bottom:16px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.stat{background:#f7f8fc;padding:12px;border-radius:9px}.stat b{display:block;font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.card{border:1px solid #e0e4ed;border-radius:10px;padding:12px;background:#fff}.card h3{margin:4px 0;font-size:16px}.muted{color:#6d7484}.danger{color:#b3261e}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}input,select{padding:9px;border:1px solid #bcc5d6;border-radius:7px;font:inherit}.hidden{display:none}video{width:100%;max-height:260px;background:#111;border-radius:8px}.creatorbar{height:5px;background:#3c65d9;border-radius:4px;margin:-12px -12px 9px}.row{display:flex;justify-content:space-between;gap:8px;align-items:center}small{overflow-wrap:anywhere;color:#687187}.badge{font-size:12px;padding:3px 7px;border-radius:999px;background:#eef1f8}.dangerbtn{background:#b3261e;color:#fff}.playerShell{max-width:560px;margin:auto;background:#111;color:#fff;border-radius:14px;overflow:hidden;position:relative}.playerTop{padding:12px;background:#181b27;display:flex;justify-content:space-between;align-items:center}.feedViewport{height:min(78vh,780px);min-height:520px;position:relative;background:#000;overflow:hidden;outline:none}.feedViewport>video{width:100%;height:100%;max-height:none;object-fit:contain}.videoOverlay{position:absolute;inset:auto 0 0;padding:70px 18px 18px;background:linear-gradient(transparent,rgba(0,0,0,.86));pointer-events:none}.videoOverlay h2,.videoOverlay p{margin:4px 0;text-shadow:0 1px 3px #000}.videoOverlay .actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px;pointer-events:auto}.videoOverlay button{background:rgba(255,255,255,.9);color:#202535}.playerHelp{padding:10px;text-align:center;background:#181b27;color:#b9c1d4;font-size:12px}@keyframes heart{0%{opacity:0;transform:translate(-50%,-50%) scale(.5)}30%{opacity:1}100%{opacity:0;transform:translate(-50%,-50%) scale(1.25)}}@media(max-width:600px){main{padding:8px}.feedViewport{height:calc(100vh - 145px);min-height:420px}}
+</style>
+<header><strong>本地抖音工作台</strong><span id="mode">浏览模式</span></header><main><div id="login" class="panel"><h2>进入工作台</h2><p>浏览可直接进入；管理操作需要固定管理密码。</p><input id="pw" type="password" placeholder="管理密码"><button class="primary" onclick="login()">进入管理模式</button><button onclick="browse()">浏览模式</button><p id="loginmsg" class="danger"></p></div><div id="app" class="hidden"><nav class="tabs"><button data-tab="home" class="active">总览</button><button data-tab="creators">博主整理</button><button data-tab="review">待确认</button><button data-tab="player">播放器</button></nav><section id="home" class="tab"></section><section id="creators" class="tab hidden"></section><section id="review" class="tab hidden"></section><section id="player" class="tab hidden"></section></div></main>
+<script>
+let token='',admin=false,cache={};
+const $=x=>document.querySelector(x), esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{'X-Admin-Token':token}:{})};let r=await fetch(path,opt);if(!r.ok)throw Error(await r.text());return r.json()}
+function browse(){admin=false;$('#login').classList.add('hidden');$('#app').classList.remove('hidden');load()}
+async function login(){try{let x=await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#pw').value})});token=x.token;admin=true;$('#login').classList.add('hidden');$('#app').classList.remove('hidden');$('#mode').textContent='管理模式';load()}catch(e){$('#loginmsg').textContent='密码不正确'}}
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.tab').forEach(x=>x.classList.add('hidden'));$('#'+b.dataset.tab).classList.remove('hidden');render(b.dataset.tab)});
+async function load(){cache.summary=await api('/api/summary');cache.creators=await api('/api/creators');cache.files=await api('/api/files?limit=100');cache.similar=await api('/api/similar');render('home')}
+function render(tab){if(tab==='home')renderHome();if(tab==='creators')renderCreators();if(tab==='review')renderReview();if(tab==='player')renderPlayer()}
+function renderHome(){let s=cache.summary;$('#home').innerHTML='<div class="panel"><h2>工作台总览</h2><div class="stats">'+[['可用文件',s.available],['博主身份',s.creators],['作品',s.works],['重复副本',s.duplicates],['相似候选',s.similar],['待确认文件',s.unknown]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')+'</div></div><div class="panel"><h3>建议顺序</h3><p>先处理博主身份和相似候选，再进入播放器。所有管理动作都要在管理模式确认。</p><button onclick="go(&quot;creators&quot;)">开始博主整理</button> <button onclick="go(&quot;review&quot;)">查看待确认</button></div>'}
+function go(t){document.querySelector('[data-tab="'+t+'"]').click()}
+function renderCreators(){let q=cache.creatorQ||'';let list=cache.creators.filter(x=>!q||(x.name||'').toLowerCase().includes(q.toLowerCase())||x.id.toLowerCase().includes(q.toLowerCase()));$('#creators').innerHTML='<div class="panel"><h2>博主整理</h2><div class="toolbar"><input id="cq" value="'+esc(q)+'" placeholder="搜索博主名或编号"><button id="creatorSearchButton">搜索</button><button id="candidateButton">名称合并候选</button><span class="muted">同名身份默认分开</span></div><div id="candidatePanel"></div><div class="grid">'+list.map(x=>'<article class="card"><div class="creatorbar"></div><h3>'+esc(x.name||'博主待确认')+'</h3><p>文件 '+x.file_count+' · 视频 '+x.video_count+' · 图片 '+x.image_count+'</p><small>'+esc(x.id)+'<br>'+esc(x.identity_status||'')+'</small>'+(admin?'<p><button class="editCreatorButton" data-id="'+esc(x.id)+'">修改归类</button></p>':'')+'</article>').join('')+'</div></div>';$('#creatorSearchButton').onclick=creatorSearch;$('#candidateButton').onclick=showCandidates;document.querySelectorAll('.editCreatorButton').forEach(b=>b.onclick=()=>editCreator(b.dataset.id))}
+async function showCandidates(){let x=await api('/api/creator-candidates');let cards=x.map(g=>{let people=g.items.map(i=>esc(i.name)+' · '+i.file_count+' 个文件 · '+esc(i.id)).join('<br>');let action=admin?'<button class="mergeButton" data-a="'+g.items[0].id+'" data-b="'+g.items[1].id+'">合并到第一个身份</button>':'';return '<div class="card"><b>'+esc(g.normalized_name)+'</b><p>'+people+'</p>'+action+' <button class="keepButton">保持分开</button></div>'}).join('');$('#candidatePanel').innerHTML='<div class="panel"><h3>名称合并候选</h3>'+(cards||'<p>暂无规范化名称相同的候选。</p>')+'</div>';document.querySelectorAll('.mergeButton').forEach(b=>b.onclick=()=>mergeCreators(b.dataset.a,b.dataset.b));document.querySelectorAll('.keepButton').forEach(b=>b.onclick=e=>e.target.closest('.card').remove())}
+async function mergeCreators(a,b){if(!confirm('确认合并这两个博主身份？原始记录会保留为别名。'))return;await api('/api/creator-merge',{method:'POST',body:JSON.stringify({primary:a,secondary:b})});cache.creators=await api('/api/creators');renderCreators();alert('已合并，原身份已保留为别名记录')}
+function creatorSearch(){cache.creatorQ=$('#cq').value;renderCreators()}
+async function editCreator(id){let name=prompt('输入新的博主名；留空取消');if(!name)return;await api('/api/creator/'+id,{method:'POST',body:JSON.stringify({name})});cache.creators=await api('/api/creators');renderCreators()}
+function renderReview(){let files=cache.files.filter(x=>x.status!=='已永久删除');$('#review').innerHTML='<div class="panel"><h2>待确认与异常</h2><p>当前只显示未删除记录。</p><div class="grid">'+files.slice(0,60).map(x=>'<article class="card"><h3>'+esc(x.title||x.name||'未命名')+'</h3><p>'+esc(x.creator||'博主待确认')+' · '+esc(x.media_status||x.status||'')+'</p><small>'+esc(x.current_path)+'</small></article>').join('')+'</div></div><div class="panel"><h2>相似候选</h2>'+cache.similar.map(x=>'<div class="card"><p>'+esc(x.reason)+' · 参考值 '+x.score+'</p><button class="similarReview" data-a="'+esc(x.a)+'" data-b="'+esc(x.b)+'" data-decision="同一作品的不同版本">同一作品版本</button> <button class="similarReview" data-a="'+esc(x.a)+'" data-b="'+esc(x.b)+'" data-decision="不同作品">不同作品</button> <button class="similarReview" data-a="'+esc(x.a)+'" data-b="'+esc(x.b)+'" data-decision="暂不确定">暂不确定</button></div>').join('')+'</div>';document.querySelectorAll('.similarReview').forEach(b=>b.onclick=()=>review(b.dataset.a,b.dataset.b,b.dataset.decision))}
+async function review(a,b,decision){if(!admin){alert('请先进入管理模式');return}await api('/api/review',{method:'POST',body:JSON.stringify({a,b,decision})});cache.similar=await api('/api/similar');renderReview()}
+let feed=[],feedIndex=0,currentVideo=null,mode='recommend',sessionMode='test',tempBlockedVideos=new Set(),tempBlockedCreators=new Set();
+function renderPlayer(){
+ $('#player').innerHTML='<div class="playerShell"><div class="playerTop"><select id="feedMode"><option value="recommend">推荐</option><option value="creator">博主轮播</option><option value="random">随机探索</option></select><button id="modeButton">管理/测试模式</button><span id="reason"></span></div><div id="modeNotice" class="modeNotice">管理/测试模式：不会影响真实推荐</div><div id="feedViewport" class="feedViewport" tabindex="0"></div><div class="playerHelp">↑↓ / 滚轮切换　双击喜欢　←返回　空格暂停</div></div>';
+ $('#feedMode').value=mode;$('#feedMode').onchange=()=>{mode=$('#feedMode').value;startFeed()};$('#modeButton').onclick=toggleRealMode;
+ let vp=$('#feedViewport');vp.onwheel=e=>{e.preventDefault();step(e.deltaY>0?1:-1)};vp.onkeydown=e=>{if(e.key==='ArrowDown')step(1);if(e.key==='ArrowUp')step(-1);if(e.key===' '){e.preventDefault();let v=vp.querySelector('video');if(v)v.paused?v.play():v.pause()}};
+ let startY=0;vp.ontouchstart=e=>startY=e.touches[0].clientY;vp.ontouchend=e=>{let d=startY-e.changedTouches[0].clientY;if(Math.abs(d)>window.innerHeight*.2)step(d>0?1:-1)};
+ startFeed();
+}
+async function startFeed(){try{feed=await api('/api/feed?mode='+mode);feed=filterTemp(feed);feedIndex=0;showFeed()}catch(e){$('#feedViewport').innerHTML='<p class="danger">推荐流加载失败：'+esc(e.message)+'</p>'}}
+function filterTemp(list){return list.filter(x=>!tempBlockedVideos.has(x.file_id)&&!tempBlockedCreators.has(x.creator_id))}
+function toggleRealMode(){if(sessionMode==='real'){sessionMode='test';$('#modeButton').textContent='管理/测试模式';$('#modeNotice').textContent='管理/测试模式：不会影响真实推荐';$('#modeNotice').className='modeNotice';return}if(!confirm('进入真实推荐模式后，观看、喜欢、跳过和屏蔽会影响推荐结果。确定进入？'))return;sessionMode='real';$('#modeButton').textContent='真实推荐模式';$('#modeNotice').textContent='真实推荐模式：行为会影响推荐';$('#modeNotice').className='modeNotice real'}
+function showFeed(){let x=feed[feedIndex];if(!x){$('#feedViewport').innerHTML='<p>没有符合条件的视频。</p>';return}currentVideo=x;let vp=$('#feedViewport');vp.innerHTML='<video id="activeVideo" playsinline muted preload="auto"></video><div class="videoOverlay"><h2>'+esc(x.title||'未命名')+'</h2><p>@'+esc(x.creator||'博主待确认')+' · '+(x.duration||'')+' 秒</p><p class="why">'+esc(x.reason||'来自本地视频库')+'</p><div class="actions"><button id="likeBtn">♡ 喜欢</button><button id="blockVideo">不喜欢此视频</button><button id="blockCreator">不喜欢此博主</button><button id="nextBtn">下一个</button></div></div>';let v=$('#activeVideo');v.src='/media?path='+encodeURIComponent(x.current_path);v.muted=localStorage.getItem('muted')==='1';v.onplay=()=>sendEvent('play_start');v.ontimeupdate=()=>{if(v.currentTime>3&&!x.counted){x.counted=true;sendEvent('watch_start',{watch_ms:Math.round(v.currentTime*1000)})}};v.onended=()=>{sendEvent('complete',{watch_ms:Math.round(v.duration*1000)});step(1)};v.play().catch(()=>{});vp.onpointerdown=e=>{x.doubleClickAt=Date.now()};vp.ondblclick=e=>{if(e.target.closest('button'))return;sendEvent('like');$('#likeBtn').textContent='♥ 已喜欢';showHeart()};$('#likeBtn').onclick=()=>sendEvent('like');$('#blockVideo').onclick=()=>block('video');$('#blockCreator').onclick=()=>block('creator');$('#nextBtn').onclick=()=>step(1);$('#reason').textContent=x.reason||'';preload(1);preload(-1)}
+function showHeart(){let h=document.createElement('div');h.textContent='♥';h.style='position:absolute;left:50%;top:42%;font-size:90px;color:#ff3b6b;transform:translate(-50%,-50%);animation:heart .55s ease-out forwards;pointer-events:none';$('#feedViewport').appendChild(h);setTimeout(()=>h.remove(),650)}
+function step(delta){if(!feed.length)return;let v=$('#activeVideo');if(v)sendEvent(delta>0?'skip':'rewind',{watch_ms:Math.round((v.currentTime||0)*1000)});feedIndex=Math.max(0,Math.min(feed.length-1,feedIndex+delta));showFeed()}
+function preload(d){let x=feed[feedIndex+d];if(x){let v=document.createElement('video');v.preload='metadata';v.src='/media?path='+encodeURIComponent(x.current_path)}}
+async function sendEvent(event_type,extra={}){if(!currentVideo||sessionMode!=='real')return;try{await api('/api/event',{method:'POST',body:JSON.stringify({file_id:currentVideo.file_id,work_id:currentVideo.work_id,event_type,watch_ms:extra.watch_ms||0,mode:sessionMode,extra})})}catch(e){}}
+async function block(kind){if(!currentVideo)return;let label=kind==='creator'?'这个博主的全部视频':'这个视频';if(!confirm('以后不再推荐'+label+'？'))return;if(kind==='creator')tempBlockedCreators.add(currentVideo.creator_id);else tempBlockedVideos.add(currentVideo.file_id);await sendEvent(kind==='creator'?'block_creator':'block_video');feed=filterTemp(await api('/api/feed?mode='+mode));feedIndex=Math.min(feedIndex,Math.max(0,feed.length-1));showFeed()}
+load().catch(()=>{});
+</script></html>'''
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args): pass
+    def send_json(self, obj, status=200):
+        data=json.dumps(obj,ensure_ascii=False).encode(); self.send_response(status); self.send_header('Content-Type','application/json; charset=utf-8'); self.send_header('Content-Length',str(len(data))); self.end_headers(); self.wfile.write(data)
+    def body(self):
+        n=int(self.headers.get('Content-Length','0')); return json.loads(self.rfile.read(n) or b'{}')
+    def admin(self): return self.headers.get('X-Admin-Token') in SESSIONS
+    def do_GET(self):
+        u=urlparse(self.path)
+        if u.path in ('/','/index.html'):
+            b=INDEX.encode(); self.send_response(200); self.send_header('Content-Type','text/html; charset=utf-8'); self.send_header('Content-Length',str(len(b))); self.end_headers(); self.wfile.write(b); return
+        c=db()
+        try:
+            if u.path=='/api/summary':
+                x=c.execute("select count(*) n from files where status!='已永久删除'").fetchone()['n']; self.send_json({'available':x,'creators':c.execute('select count(*) n from creators').fetchone()['n'],'works':c.execute('select count(*) n from works').fetchone()['n'],'duplicates':c.execute("select count(*) n from files where duplicate_of is not null and status!='已永久删除'").fetchone()['n'],'similar':c.execute('select count(*) n from similar').fetchone()['n'],'unknown':c.execute("select count(*) n from files where creator_id is null and status!='已永久删除'").fetchone()['n']}); return
+            if u.path=='/api/creators': self.send_json(rows(c,"select c.id,c.name,c.platform_id,c.identity_status,count(f.id) file_count,sum(case when f.kind='video' then 1 else 0 end) video_count,sum(case when f.kind='image' then 1 else 0 end) image_count from creators c left join files f on f.creator_id=c.id and f.status!='已永久删除' group by c.id order by file_count desc,c.name")); return
+            if u.path=='/api/creator-candidates':
+                items=rows(c,"select c.id,c.name,count(f.id) file_count from creators c left join files f on f.creator_id=c.id and f.status!='已永久删除' group by c.id")
+                groups={}
+                for x in items: groups.setdefault(normalize_creator(x['name']),[]).append(x)
+                self.send_json([{'normalized_name':k,'items':v} for k,v in groups.items() if k and len(v)>1]); return
+            if u.path=='/api/files': self.send_json(rows(c,"select f.id,f.current_path,f.status,f.kind,f.duplicate_of,w.title,coalesce(cr.name,'博主待确认') creator,m.status media_status,m.duration from files f left join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id where f.status!='已永久删除' order by f.id limit 100")); return
+            if u.path=='/api/feed':
+                mode=parse_qs(u.query).get('mode',['recommend'])[0]
+                order={'random':'random()','creator':'f.creator_id,random()','recommend':'random()'}.get(mode,'random()')
+                sql=f'''select f.id file_id,f.work_id,f.creator_id,f.current_path,f.status,w.title,coalesce(cr.name,'博主待确认') creator,m.duration,
+                    case when ?='creator' then '博主轮播' when ?='random' then '随机探索' else '本地推荐' end reason
+                    from files f left join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
+                    where f.kind='video' and f.status!='已永久删除' and f.duplicate_of is null
+                    and coalesce(m.status,'') not in ('仅音频，扩展名为MP4','下载未完成','无法抽帧','检查失败')
+                    and not exists(select 1 from feedback b where b.event_type='block_video' and b.extra_json like '%"file_id":"'||f.id||'"%')
+                    and not exists(select 1 from feedback b where b.event_type='block_creator' and b.extra_json like '%"creator_id":"'||coalesce(f.creator_id,'')||'"%')
+                    order by {order} limit 120'''
+                self.send_json(rows(c,sql,(mode,mode))); return
+            if u.path=='/api/similar': self.send_json(rows(c,'select * from similar order by score desc')); return
+            if u.path=='/media':
+                p=safe_path(parse_qs(u.query).get('path',[''])[0]);
+                if not p or not p.is_file(): self.send_error(404); return
+                size=p.stat().st_size; self.send_response(200); self.send_header('Content-Type','video/mp4'); self.send_header('Content-Length',str(size)); self.end_headers();
+                with p.open('rb') as f: shutil.copyfileobj(f,self.wfile); return
+            self.send_error(404)
+        finally: c.close()
+    def do_POST(self):
+        u=urlparse(self.path); data=self.body()
+        if u.path=='/api/login':
+            if secrets.compare_digest(str(data.get('password','')),str(CFG['management_password'])):
+                t=secrets.token_urlsafe(24); SESSIONS[t]=time.time(); self.send_json({'token':t}); return
+            self.send_json({'error':'密码错误'},401); return
+        if u.path=='/api/event':
+            if data.get('mode')!='real':
+                self.send_json({'ok':True,'recorded':False,'mode':'test'}); return
+            c=db()
+            try:
+                import uuid,datetime
+                file_id=data.get('file_id'); fr=c.execute('select work_id,creator_id from files where id=?',(file_id,)).fetchone()
+                if not fr: self.send_json({'error':'文件不存在'},404); return
+                extra=dict(data.get('extra') or {}); extra.update(file_id=file_id,creator_id=fr['creator_id'])
+                c.execute('insert into feedback(id,work_id,event_at,event_type,watch_ms,session_id,recommender_version,extra_json) values(?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,fr['work_id'],datetime.datetime.now().astimezone().isoformat(timespec='seconds'),data.get('event_type','play_start'),int(data.get('watch_ms') or 0),self.headers.get('X-Session','local'), 'feed-v1',json.dumps(extra,ensure_ascii=False)))
+                c.commit(); self.send_json({'ok':True}); return
+            finally: c.close()
+        if not self.admin(): self.send_json({'error':'需要管理权限'},403); return
+        c=db()
+        try:
+            if u.path.startswith('/api/creator/'):
+                cid=u.path.rsplit('/',1)[-1]; old=c.execute('select * from creators where id=?',(cid,)).fetchone();
+                if not old: self.send_json({'error':'找不到博主'},404); return
+                c.execute('update creators set name=?,identity_status=? where id=?',(str(data.get('name') or old['name']),'人工确认',cid)); c.commit(); self.send_json({'ok':True}); return
+            if u.path=='/api/creator-merge':
+                primary,secondary=data.get('primary'),data.get('secondary')
+                a=c.execute('select * from creators where id=?',(primary,)).fetchone(); b=c.execute('select * from creators where id=?',(secondary,)).fetchone()
+                if not a or not b or primary==secondary: self.send_json({'error':'博主身份不存在'},400); return
+                aliases=[]
+                for raw in (a['aliases_json'],b['aliases_json']):
+                    try: aliases.extend(json.loads(raw or '[]'))
+                    except Exception: pass
+                aliases.extend([{'id':b['id'],'name':b['name']}])
+                c.execute('update creators set aliases_json=?,identity_status=? where id=?',(json.dumps(aliases,ensure_ascii=False),'人工确认',primary))
+                c.execute('update files set creator_id=? where creator_id=?',(primary,secondary)); c.execute('update works set creator_id=? where creator_id=?',(primary,secondary)); c.execute('insert into review_log(created_at,object_type,object_id,old_json,new_json) values(?,?,?,?,?)',(time.strftime('%Y-%m-%dT%H:%M:%S%z'),'creator_merge',primary,json.dumps({'secondary':secondary,'name':b['name']},ensure_ascii=False),json.dumps({'primary':primary},ensure_ascii=False))); c.commit(); self.send_json({'ok':True}); return
+            if u.path=='/api/review':
+                c.execute('update similar set decision=?,note=? where a=? and b=?',(data.get('decision','暂不确定'),data.get('note',''),data.get('a'),data.get('b'))); c.commit(); self.send_json({'ok':True}); return
+            self.send_json({'error':'未知操作'},404)
+        finally: c.close()
+
+if __name__=='__main__':
+    print(f'本地抖音工作台: http://127.0.0.1:{PORT}')
+    print(f'局域网地址: http://<本机IP>:{PORT}')
+    print('管理密码已写入:', CONFIG)
+    ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
