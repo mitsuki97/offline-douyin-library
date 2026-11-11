@@ -23,15 +23,15 @@ const sh = (sheet, headers, rows, widths) => {
   widths.forEach((w,i)=>sheet.getRangeByIndexes(0,i,matrix.length,1).format.columnWidth=w);
   sheet.freezePanes.freezeRows(1); sheet.showGridLines=false;
 };
-const sHeaders=['博主','主页链接','主页读取状态','发现作品数','有点赞量','有播放量','已下载','未下载/失败'];
+const sHeaders=['博主','主页链接','主页读取状态','发现作品数','有点赞量','有播放量','已下载','未下载/失败','绝版/不可访问'];
 const sRows=creators.map(c=>{
  const xs=works.filter(w=>w.creator_url===c.url);
- return [c.name||'',c.url||'',xs.length?'已采集':'无作品或读取失败',xs.length,xs.filter(w=>Number.isFinite(w.digg_count)).length,xs.filter(w=>Number.isFinite(w.play_count)).length,xs.filter(w=>['已下载','已存在'].includes(w.download_status)).length,xs.filter(w=>!['已下载','已存在'].includes(w.download_status)).length];
+ return [c.name||'',c.url||'',xs.length?'已采集':'无作品或读取失败',xs.length,xs.filter(w=>Number.isFinite(w.digg_count)).length,xs.filter(w=>Number.isFinite(w.play_count)).length,xs.filter(w=>['已下载','已存在'].includes(w.download_status)).length,xs.filter(w=>!['已下载','已存在'].includes(w.download_status)).length,xs.filter(w=>String(w.availability_status||'').startsWith('绝版')).length];
 });
-sh(summary,sHeaders,sRows,[24,54,22,14,14,14,12,18]);
-const dHeaders=['博主','作品ID','标题','发布时间','播放量','点赞量','收藏量','评论量','分享量','作品链接','下载状态','本地路径','读取状态'];
-const dRows=works.map(w=>[w.creator||'',w.aweme_id||'',w.title||'',w.publish_time||'',w.play_count??'',w.digg_count??'',w.collect_count??'',w.comment_count??'',w.share_count??'',w.url||'',w.download_status||'未尝试',w.local_path||'',w.read_status||'']);
-sh(detail,dHeaders,dRows,[24,22,42,21,13,13,13,13,13,50,18,60,22]);
+sh(summary,sHeaders,sRows,[24,54,22,14,14,14,12,18,18]);
+const dHeaders=['博主','作品ID','标题','发布时间','播放量','点赞量','收藏量','评论量','分享量','作品链接','下载状态','本地路径','读取状态','可访问状态','筛选原因','最后检查时间'];
+const dRows=works.map(w=>[w.creator||'',w.aweme_id||'',w.title||'',w.publish_time||'',w.play_count??'',w.digg_count??'',w.collect_count??'',w.comment_count??'',w.share_count??'',w.url||'',w.download_status||'未尝试',w.local_path||'',w.read_status||'',w.availability_status||'正常',w.selection_reason||'',w.last_checked_at||'']);
+sh(detail,dHeaders,dRows,[24,22,42,21,13,13,13,13,13,50,18,60,22,20,24,21]);
 const eHeaders=['博主','主页链接','阶段/错误'];
 const eRows=errors.map(e=>[e.creator||'',e.url||'',e.error||'']);
 if(state.fatal_error)eRows.unshift(['','',state.fatal_error]);
@@ -39,7 +39,7 @@ sh(issue,eHeaders,eRows,[24,54,100]);
 await wb.recalculate();
 const inspect=await wb.inspect({kind:'sheet,region',maxChars:2200,tableMaxRows:3,tableMaxCols:8});
 console.log(inspect.ndjson||inspect);
-for(const [name,range] of [['博主汇总',`A1:H${Math.max(2,Math.min(creators.length+1,26))}`],['全部作品','A1:M20'],['读取失败','A1:C20']]){
+for(const [name,range] of [['博主汇总',`A1:I${Math.max(2,Math.min(creators.length+1,26))}`],['全部作品','A1:P20'],['读取失败','A1:C20']]){
  const png=await wb.render({sheetName:name,range,scale:1,format:'png'});
  const safe=name.replace(/[\\/:*?"<>|]/g,'_'); await fs.writeFile(`${outPath}.preview.${safe}.png`,new Uint8Array(await png.arrayBuffer()));
 }

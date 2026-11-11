@@ -1,8 +1,10 @@
 from __future__ import annotations
 import csv, hashlib, json, os, queue, re, secrets, shutil, socket, subprocess, sys, threading, time, uuid
+import sqlite3
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from harvest_store import sync as sync_harvest_store
 
 BASE=Path(__file__).resolve().parent.parent
 LIB=BASE/'本地视频库'
@@ -12,6 +14,7 @@ HOST=os.environ.get('DOUYIN_DOWNLOADER_HOST','127.0.0.1'); PORT=int(os.environ.g
 LOGIN_BROWSER=None; LOGIN_CONTEXT=None; LOGIN_PLAYWRIGHT=None; LOGIN_PROCESS=None; LOGIN_THREAD=None; LOGIN_QUEUE=queue.Queue(); LOGIN_READY=threading.Event(); INTERACTIVE_LOCK=threading.Lock()
 HARVEST_DIR=LIB/'关注归档'; HARVEST_DIR.mkdir(parents=True,exist_ok=True)
 HARVEST_STATE=HARVEST_DIR/'采集进度.json'; HARVEST_LOCK=threading.Lock(); HARVEST_WRITE_LOCK=threading.RLock(); HARVEST_THREAD=None
+HARVEST_DB=HARVEST_DIR/'采集索引.sqlite3'; HARVEST_DATA=HARVEST_DIR/'数据'
 HARVEST_PAUSE=threading.Event(); HARVEST_STOP=threading.Event(); DOWNLOADER_SESSIONS={}
 HARVEST_CLEAR_LOCK=threading.RLock(); HARVEST_CLEAR_THREAD=None; HARVEST_CLEAR_STATUS={'status':'空闲','message':'','backup':'','removed':0}
 BACKLOG_THREAD=None; BACKLOG_LOCK=threading.RLock(); BACKLOG_STATUS={'status':'空闲','message':'','done':0,'total':0,'failed':0}
@@ -52,7 +55,7 @@ PAGE='''<!doctype html><meta charset="utf-8"><meta name="viewport" content="widt
 <h1>独立下载控制台</h1><p class="muted">局域网监控与控制关注采集、主页解析、视频下载和 Excel 导出。只读查看无需密码，管理操作需要登录。</p>
 <section class="panel"><h2>管理权限</h2><form id="adminForm" onsubmit="event.preventDefault();adminLogin()"><input id="adminPw" type="password" autocomplete="current-password" placeholder="管理密码"><button type="submit">进入管理模式</button><button type="button" onclick="adminLogout()">退出管理模式</button></form><span id="authmsg" class="muted">当前为只读模式</span></section>
 <section class="panel"><h2>扫码登录与关系列表</h2><p class="muted">点击后会打开独立 Edge 窗口，在抖音页面扫码登录。账号密码不会写入本程序。</p><button onclick="login()">打开抖音扫码登录</button><button onclick="status()">检查登录状态</button><button onclick="follows()">读取我的关注</button><button onclick="fans()">读取我的粉丝</button><button onclick="selectAll()">全选当前列表</button><button onclick="saveSelected()">保存选中博主</button><button onclick="saveAndDownload()">保存选中并批量下载</button><p id="loginmsg" class="muted"></p><p id="batchmsg" class="muted"></p><div id="batchProgress"></div><div id="followList"></div></section>
-<section class="panel"><h2>一次性采集全部关注博主</h2><p class="muted">读取全部关注主页中的可见视频和公开播放量、点赞量，逐博主保存进度；结束后生成总 Excel。视频下载到“关注归档”下的博主目录。访问受限或数据不可见时会保留状态并继续其他博主。</p><label><input id="essenceOnly" type="checkbox"> 只下载精华视频（推荐规则）</label><button onclick="startHarvest()">开始采集并下载</button><button onclick="startBacklog()">下载待下载清单（刷新 CDN）</button><button class="warn" onclick="controlHarvest('pause')">暂停</button><button onclick="controlHarvest('resume')">继续</button><button class="dangerbtn" onclick="controlHarvest('stop')">停止并保存断点</button><button onclick="controlHarvest('retry')">重试失败博主</button><button onclick="harvestStatus()">刷新进度</button><button onclick="openWorkbook()">打开 Excel</button><a href="/api/harvest-backlog-file">下载待下载 CSV</a><button class="dangerbtn" onclick="clearHarvest()">清空采集进度和内容</button><p id="harvestmsg" class="muted"></p><div id="harvest"></div><div class="stats" id="harvestStats"></div><h3>博主进度</h3><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>状态</th><th>作品</th><th>已下载</th><th>失败</th><th>主页</th></tr></thead><tbody id="creatorProgress"></tbody></table></div><h3>采集结果</h3><div class="toolbar"><input id="workSearch" placeholder="搜索博主、标题或作品ID" oninput="loadWorks()"><select id="workStatus" onchange="loadWorks()"><option value="">全部状态</option><option>已下载</option><option>已存在</option><option>无媒体地址</option><option>下载失败</option></select></div><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>标题</th><th>播放量</th><th>点赞量</th><th>发布时间</th><th>下载状态</th><th>链接</th></tr></thead><tbody id="workRows"></tbody></table></div></section>
+<section class="panel"><h2>一次性采集全部关注博主</h2><p class="muted">读取全部关注主页中的可见视频和公开播放量、点赞量，逐博主保存进度；结束后生成总 Excel。视频下载到“关注归档”下的博主目录。访问受限或数据不可见时会保留状态并继续其他博主。</p><label>下载范围：<select id="downloadProfile"><option value="essence">精华视频（点赞靠前、近期和高播放）</option><option value="standard">标准视频（按博主数量和播放量自适应放宽）</option></select></label><span class="muted"> 标准档：作品少的博主基本全下，播放量整体偏低的博主降低门槛，并保留每位博主至少 10 条候选。</span><button onclick="startHarvest('incremental')">增量更新（新博主/新视频）</button><button onclick="startHarvest('standard')">标准更新（含近期统计）</button><button onclick="startHarvest('full')">完整复核</button><button onclick="startBacklog()">下载待下载清单（刷新 CDN）</button><button class="warn" onclick="controlHarvest('pause')">暂停</button><button onclick="controlHarvest('resume')">继续</button><button class="dangerbtn" onclick="controlHarvest('stop')">停止并保存断点</button><button onclick="controlHarvest('retry')">重试失败博主</button><button onclick="harvestStatus()">刷新进度</button><button onclick="openWorkbook()">打开 Excel</button><a href="/api/harvest-backlog-file">下载待下载 CSV</a><button class="dangerbtn" onclick="clearHarvest()">清空采集进度和内容</button><button class="warn" onclick="repairDuplicates()">扫描并移入错误归属视频</button><p id="harvestmsg" class="muted"></p><div id="harvest"></div><div class="stats" id="harvestStats"></div><h3>博主进度</h3><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>状态</th><th>作品</th><th>已下载</th><th>失败</th><th>主页</th></tr></thead><tbody id="creatorProgress"></tbody></table></div><h3>采集结果</h3><div class="toolbar"><input id="workSearch" placeholder="搜索博主、标题或作品ID" oninput="loadWorks()"><select id="workStatus" onchange="loadWorks()"><option value="">全部状态</option><option>已下载</option><option>已存在</option><option>无媒体地址</option><option>下载失败</option></select></div><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>标题</th><th>播放量</th><th>点赞量</th><th>发布时间</th><th>下载状态</th><th>链接</th></tr></thead><tbody id="workRows"></tbody></table></div></section>
 <section class="panel"><h2>导入博主</h2><input id="name" placeholder="博主名称"><input id="url" style="width:420px" placeholder="博主主页链接"><button onclick="add()">保存博主</button><button onclick="exportCreators()">导出全部博主 Excel</button><button class="dangerbtn" onclick="clearCreators()">清空所有博主</button><div id="list"></div></section>
 <section class="panel"><h2>创建测试下载</h2><select id="creator"></select><input id="date" type="date"><select id="login"><option value="edge" selected>使用 Edge 登录状态</option><option value="">不使用登录</option><option value="chrome">使用 Chrome 登录状态</option><option value="firefox">使用 Firefox 登录状态</option><option value="file">使用 Cookie 文件</option></select><input id="cookie" style="width:360px" placeholder="Cookie 文件完整路径（仅选择文件时填写）"><button onclick="make()">创建并开始</button><p id="msg" class="muted"></p></section>
 <section class="panel"><h2>任务状态</h2><div id="jobs">暂无任务</div></section>
@@ -64,12 +67,13 @@ async function adminLogin(){try{let r=await api('/api/admin-login',{method:'POST
 function adminLogout(){adminToken='';$('#authmsg').textContent='当前为只读模式';}
 async function login(){try{ $('#loginmsg').textContent='正在打开登录窗口…'; let r=await api('/api/login',{method:'POST'});$('#loginmsg').textContent=r.message||r.error}catch(e){$('#loginmsg').textContent='打开登录窗口失败：'+e.message}}
 async function status(){try{let r=await api('/api/login-status');$('#loginmsg').textContent=r.message||r.error}catch(e){$('#loginmsg').textContent='检查登录状态失败：'+e.message}}
-async function startHarvest(){let essence=$('#essenceOnly').checked;if(!confirm(essence?'将采集全部数据，但每位博主只下载精华视频。继续？':'将读取账号全部关注及其主页可见视频，并按博主下载全部视频。继续？'))return;try{let r=await api('/api/harvest',{method:'POST',body:JSON.stringify({essence_only:essence})});$('#harvestmsg').textContent=r.message||r.error;harvestStatus()}catch(e){$('#harvestmsg').textContent=e.message}}
+async function startHarvest(mode='incremental'){let profile=$('#downloadProfile').value;let labels={incremental:'增量更新新博主和新视频',standard:'标准更新并复核近期统计',full:'完整复核所有可访问作品'};let names={essence:'精华视频',standard:'标准视频'};if(!confirm(`将执行${labels[mode]||mode}，下载范围：${names[profile]}。继续？`))return;try{let r=await api('/api/harvest',{method:'POST',body:JSON.stringify({download_profile:profile,essence_only:profile==='essence',mode})});$('#harvestmsg').textContent=r.message||r.error;harvestStatus()}catch(e){$('#harvestmsg').textContent=e.message}}
 async function startBacklog(){if(!confirm('将读取待下载清单，并打开每个作品页刷新当天 CDN 地址后下载。继续？'))return;try{let r=await api('/api/harvest-backlog-download',{method:'POST',body:'{}'});$('#harvestmsg').textContent=r.message||r.error;pollBacklog()}catch(e){$('#harvestmsg').textContent='待下载任务启动失败：'+e.message}}
 async function pollBacklog(){try{let r=await api('/api/harvest-backlog-status');$('#harvest').textContent=(r.message||'')+`；待下载 ${r.pending||0} 条，当前处理 ${r.done||0}/${r.total||0}，失败 ${r.failed||0}`;if(r.status==='运行中')setTimeout(pollBacklog,3000)}catch(e){}}
 async function controlHarvest(action){try{let r=await api('/api/harvest-control',{method:'POST',body:JSON.stringify({action})});$('#harvestmsg').textContent=r.message||r.error;harvestStatus()}catch(e){$('#harvestmsg').textContent=e.message}}
 function openWorkbook(){window.open('/api/harvest-file','_blank')}
 async function clearHarvest(){if(!confirm('确定清空之前的采集进度和采集内容吗？系统会先完整备份“关注归档”，不会删除博主列表、待导入视频或下载任务。'))return;try{let r=await api('/api/harvest-clear',{method:'POST',body:'{}'});$('#harvestmsg').textContent=r.message||'已开始清空并备份';harvestStatus()}catch(e){$('#harvestmsg').textContent='清空失败：'+e.message}}
+async function repairDuplicates(){if(!confirm('将按作品作者 ID 校验每个博主文件夹，并把错误归属文件移入虚拟回收站。不会永久删除。继续？'))return;try{let r=await api('/api/harvest-repair-duplicates',{method:'POST',body:'{}'});$('#harvestmsg').textContent=r.message||r.error;harvestStatus()}catch(e){$('#harvestmsg').textContent='归属修复失败：'+e.message}}
 async function harvestStatus(){try{let r=await api('/api/harvest-status');$('#harvestmsg').textContent=r.message||r.error||'';$('#harvest').textContent=r.summary||'';let pct=r.creator_total?Math.round(100*r.creator_done/r.creator_total):0;$('#harvestStats').innerHTML=[['博主进度',r.creator_done+'/'+r.creator_total],['作品记录',r.work_count],['已验证作品',r.verified_work_count||0],['未验证链接',r.unverified_link_count||0],['已读取点赞量',r.digg_count],['已验证作品缺失点赞',r.verified_digg_missing||0],['有媒体链接',r.media_url_count||0],['已下载',r.downloaded],['错误',r.error_count]].map(x=>`<div class="stat">${esc(x[0])}<b>${esc(x[1])}</b></div>`).join('')+`<div class="stat">总进度<b>${pct}%</b><div class="bar"><i style="width:${pct}%"></i></div></div>`;$('#creatorProgress').innerHTML=(r.creator_records||[]).map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.status)}</td><td>${x.works||0}</td><td>${x.downloaded||0}</td><td>${x.errors||0}</td><td><a href="${esc(x.url)}" target="_blank">打开</a></td></tr>`).join('');loadWorks();if(r.running)setTimeout(harvestStatus,3000)}catch(e){$('#harvestmsg').textContent=e.message}}
 async function loadWorks(){try{let q=new URLSearchParams({q:$('#workSearch').value||'',status:$('#workStatus').value||'',limit:'200'});let r=await api('/api/harvest-works?'+q.toString());$('#workRows').innerHTML=(r.items||[]).map(x=>`<tr><td>${esc(x.creator)}</td><td>${esc(x.title||x.aweme_id)}</td><td>${x.play_count??''}</td><td>${x.digg_count??''}</td><td>${esc(x.publish_time||'')}</td><td>${esc(x.download_status||'')}</td><td><a href="${esc(x.url)}" target="_blank">作品页</a></td></tr>`).join('')||'<tr><td colspan="7">暂无数据</td></tr>'}catch(e){}}
 let relationItems=[];
@@ -352,6 +356,24 @@ def _aweme_record(item, creator):
       'comment_count':_metric(item,'comment_count'),'share_count':_metric(item,'share_count'),'duration_ms':(video.get('duration') if isinstance(video,dict) else None),
       'media_urls':urls,'verified_aweme':True,'read_status':'已读取统计' if _metric(item,'digg_count') is not None or _metric(item,'play_count') is not None else '统计不可用'}
 
+def _creator_id_from_url(url):
+    """Return the stable user id from a Douyin /user/<id> URL."""
+    try:
+        path=urlparse(str(url or '')).path.rstrip('/')
+        if '/user/' in path: return path.rsplit('/user/',1)[1].split('/',1)[0]
+    except Exception: pass
+    return ''
+
+def _aweme_belongs_to_creator(item, creator):
+    """Reject recommendation-card works returned beside a creator's works."""
+    expected=_creator_id_from_url(creator.get('url',''))
+    if not expected: return True
+    author=item.get('author') or {}
+    actual=str(author.get('sec_uid') or author.get('secUid') or '').strip()
+    # Some lightweight responses omit author data. Keep those for now; the
+    # visible-link fallback still preserves the work URL for later checking.
+    return not actual or actual==expected
+
 def _load_harvest_state():
     try: return json.loads(HARVEST_STATE.read_text(encoding='utf-8'))
     except Exception: return {'status':'空闲','creators':[],'works':[],'errors':[],'updated_at':''}
@@ -359,6 +381,14 @@ def _load_harvest_state():
 def _save_harvest_state(state):
     with HARVEST_WRITE_LOCK:
         state['updated_at']=time.strftime('%Y-%m-%d %H:%M:%S')
+        # SQLite and the readable JSON mirrors are updated before the legacy
+        # aggregate state file. A failure here is recorded but never hides the
+        # harvest checkpoint itself.
+        try:
+            db_snapshot,snapshot=sync_harvest_store(state,HARVEST_DB,HARVEST_DATA)
+            state['dual_store']={'sqlite':str(HARVEST_DB),'json_dir':str(HARVEST_DATA),'last_sqlite_snapshot':db_snapshot,'last_json_snapshot':snapshot,'synced_at':state['updated_at']}
+        except Exception as exc:
+            state.setdefault('errors',[]).append({'creator':'双存储同步','error':str(exc)})
         tmp=HARVEST_STATE.with_suffix('.tmp'); tmp.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8'); tmp.replace(HARVEST_STATE)
         _write_download_backlog(state)
 
@@ -393,7 +423,7 @@ def harvest_status():
         status='暂停'; state['status']='暂停'; state['phase']='已暂停（服务重启或线程已结束）'; _save_harvest_state(state)
     running=status=='运行中' and alive and not HARVEST_PAUSE.is_set()
     verified=[w for w in works if w.get('verified_aweme',w.get('read_status')!='仅发现链接，统计待补')]
-    return {'status':status,'running':running,'thread_alive':alive,'phase':state.get('phase','-'),'creator_done':state.get('creator_done',0),'creator_total':state.get('creator_total',0),'work_count':len(works),'verified_work_count':len(verified),'unverified_link_count':len(works)-len(verified),'play_count':sum(1 for w in works if w.get('play_count') is not None),'digg_count':sum(1 for w in works if w.get('digg_count') is not None),'play_missing':sum(1 for w in works if w.get('play_count') is None),'digg_missing':sum(1 for w in works if w.get('digg_count') is None),'verified_digg_missing':sum(1 for w in verified if w.get('digg_count') is None),'media_url_count':sum(1 for w in works if w.get('media_urls')),'downloaded':sum(1 for w in works if w.get('download_status') in ('已下载','已存在')),'error_count':len(state.get('errors',[])),'creator_records':state.get('creator_records',[]),'summary':f"阶段：{state.get('phase','-')}；博主 {state.get('creator_done',0)}/{state.get('creator_total',0)}；作品 {len(works)}；失败记录 {len(state.get('errors',[]))}；最近更新 {state.get('updated_at','-')}",
+    return {'status':status,'running':running,'thread_alive':alive,'mode':state.get('harvest_mode','incremental'),'download_profile':state.get('download_profile') or ('essence' if state.get('essence_only') else 'all'),'phase':state.get('phase','-'),'creator_done':state.get('creator_done',0),'creator_total':state.get('creator_total',0),'work_count':len(works),'verified_work_count':len(verified),'unverified_link_count':len(works)-len(verified),'play_count':sum(1 for w in works if w.get('play_count') is not None),'digg_count':sum(1 for w in works if w.get('digg_count') is not None),'play_missing':sum(1 for w in works if w.get('play_count') is None),'digg_missing':sum(1 for w in works if w.get('digg_count') is None),'verified_digg_missing':sum(1 for w in verified if w.get('digg_count') is None),'media_url_count':sum(1 for w in works if w.get('media_urls')),'downloaded':sum(1 for w in works if w.get('download_status') in ('已下载','已存在')),'extinct_count':sum(1 for w in works if str(w.get('availability_status','')).startswith('绝版')),'error_count':len(state.get('errors',[])),'creator_records':state.get('creator_records',[]),'dual_store':state.get('dual_store',{}),'summary':f"阶段：{state.get('phase','-')}；博主 {state.get('creator_done',0)}/{state.get('creator_total',0)}；范围 {state.get('download_profile') or ('精华' if state.get('essence_only') else '全部')}；作品 {len(works)}；失败记录 {len(state.get('errors',[]))}；最近更新 {state.get('updated_at','-')}",
       'message':f"采集任务{status}。" if status!='运行中' else '采集中，保持登录窗口开启。'}
 
 def harvest_works(query):
@@ -429,6 +459,7 @@ def _collect_creator_all(ctx, creator):
         try:
             payload=response.json()
             for aweme in _walk_awemes(payload):
+                if not _aweme_belongs_to_creator(aweme,creator): continue
                 rec=_aweme_record(aweme,creator)
                 if rec['aweme_id']: found[rec['aweme_id']]=rec
             # Common Douyin response shapes report continuation at top level or in data.
@@ -507,13 +538,25 @@ def _refresh_aweme_media(rec, ctx):
     page.on('response',on_response)
     try:
         page.goto(url,wait_until='domcontentloaded',timeout=45000); page.bring_to_front(); page.wait_for_timeout(3500)
+        rec['last_checked_at']=time.strftime('%Y-%m-%d %H:%M:%S')
         item=found.get('item')
         if item:
             fresh=_aweme_record(item,{'name':rec.get('creator',''),'url':rec.get('creator_url','')})
             for key in ('title','publish_time','play_count','digg_count','collect_count','comment_count','share_count','duration_ms','media_urls','read_status'):
                 if fresh.get(key) not in (None,'',[]): rec[key]=fresh[key]
             rec['last_cdn_seen_at']=time.strftime('%Y-%m-%d %H:%M:%S')
+            rec['availability_status']='正常'; rec['availability_failures']=0
             return bool(rec.get('media_urls'))
+        try:
+            body=page.locator('body').inner_text(timeout=3000)
+        except Exception: body=''
+        rec['availability_failures']=int(rec.get('availability_failures') or 0)+1
+        if any(x in body for x in ('作品不存在','作品已删除','内容不可见','视频不存在')):
+            rec['availability_status']='绝版-作品已删除'
+        elif rec['availability_failures']>=2:
+            rec['availability_status']='绝版-待人工确认'
+        else:
+            rec['availability_status']='暂时不可访问'
         return False
     finally:
         try: page.remove_listener('response',on_response)
@@ -571,7 +614,7 @@ def _essence_aweme_ids(works):
     ranked=sorted(valid,key=lambda w:w.get('digg_count',0),reverse=True)
     chosen={str(w.get('aweme_id')) for w in ranked[:quota] if w.get('aweme_id')}
     # Always keep the latest three and videos with verified play count >= 8000.
-    recent=sorted(works,key=lambda w:str(w.get('publish_time') or ''),reverse=True)[:3]
+    recent=sorted([w for w in works if w.get('verified_aweme',w.get('read_status')!='仅发现链接，统计待补')],key=lambda w:str(w.get('publish_time') or ''),reverse=True)[:3]
     chosen.update(str(w.get('aweme_id')) for w in recent if w.get('aweme_id'))
     chosen.update(str(w.get('aweme_id')) for w in works if w.get('verified_aweme',w.get('read_status')!='仅发现链接，统计待补') and w.get('aweme_id') and isinstance(w.get('play_count'),(int,float)) and w.get('play_count')>=8000)
     # Keep unusually strong works even if their rank fell below the quota.
@@ -581,9 +624,51 @@ def _essence_aweme_ids(works):
         chosen.update(str(w.get('aweme_id')) for w in valid if w.get('digg_count',0)>=median*3 and w.get('aweme_id'))
     return chosen
 
+def _standard_aweme_ids(works):
+    """Select a wider, creator-aware download set for the 标准档.
+
+    The quota grows for small creators and for creators whose overall reach is
+    low.  This keeps a small account from being reduced to a few viral clips.
+    Stable metadata is used for selection; CDN URLs are refreshed only when a
+    selected item is downloaded.
+    """
+    valid=[w for w in works if w.get('verified_aweme',w.get('read_status')!='仅发现链接，统计待补') and w.get('aweme_id')]
+    n=len(valid)
+    if not n: return set()
+    plays=sorted([float(w['play_count']) for w in valid if isinstance(w.get('play_count'),(int,float))])
+    median=plays[len(plays)//2] if plays else 0
+    # Small creators are almost completely archived. Larger creators use a
+    # wider percentile than 精华, with a floor of 10 works.
+    if n<=20: ratio=1.00
+    elif n<=50: ratio=.80
+    elif n<=100: ratio=.70
+    elif n<=300: ratio=.60
+    else: ratio=.50
+    if median and median<8000: ratio=min(1.0, ratio+.15)
+    quota=max(10, int(n*ratio+0.999))
+    chosen=set()
+    ranked_likes=sorted(valid,key=lambda w:(w.get('digg_count') if isinstance(w.get('digg_count'),(int,float)) else -1),reverse=True)
+    ranked_plays=sorted(valid,key=lambda w:(w.get('play_count') if isinstance(w.get('play_count'),(int,float)) else -1),reverse=True)
+    for row in ranked_likes[:quota]: chosen.add(str(row['aweme_id']))
+    # Add a modest play-count band. For low-reach creators this threshold is
+    # intentionally low; for normal creators keep the established 8000 floor.
+    play_floor=max(1000, int(median*.50)) if median and median<8000 else 8000
+    for row in valid:
+        if isinstance(row.get('play_count'),(int,float)) and row['play_count']>=play_floor:
+            chosen.add(str(row['aweme_id']))
+    recent=sorted(valid,key=lambda w:str(w.get('publish_time') or ''),reverse=True)[:10]
+    chosen.update(str(row['aweme_id']) for row in recent)
+    # Guarantee at least ten items where the creator has ten or more works.
+    if len(chosen)<min(10,n):
+        for row in ranked_likes:
+            chosen.add(str(row['aweme_id']))
+            if len(chosen)>=min(10,n): break
+    return chosen
+
 def _harvest_worker(resume=False):
     state=_load_harvest_state();
-    essence_only=bool(state.get('essence_only',False)); state['status']='运行中'; state['phase']='读取关注列表'; state['errors']=state.get('errors',[]); _save_harvest_state(state)
+    profile=str(state.get('download_profile') or ('essence' if state.get('essence_only') else 'all'))
+    essence_only=profile=='essence'; state['download_profile']=profile; state['status']='运行中'; state['phase']='读取关注列表'; state['errors']=state.get('errors',[]); _save_harvest_state(state)
     try:
         # Keep the long-running harvest context authenticated without making
         # the login/status controls wait on its browser thread.
@@ -620,7 +705,7 @@ def _harvest_worker(resume=False):
                     state['works']=list(known.values()); _save_harvest_state(state)
                     (folder/'主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8')
                     done=0; failed=0
-                    essence_ids=_essence_aweme_ids(works) if essence_only else {str(r.get('aweme_id')) for r in works}
+                    selected_ids=(_essence_aweme_ids(works) if profile=='essence' else _standard_aweme_ids(works) if profile=='standard' else {str(r.get('aweme_id')) for r in works})
                     for rec in works:
                         _harvest_checkpoint(state)
                         prev=known.get(rec['aweme_id'],{}); prev.update(rec)
@@ -628,10 +713,12 @@ def _harvest_worker(resume=False):
                             prev['download_status']='未验证链接（仅保留链接）'; prev['local_path']=''
                             known[rec['aweme_id']]=prev
                             continue
-                        if essence_only and str(rec.get('aweme_id')) not in essence_ids:
-                            prev['download_status']='未选择（精华筛选）'; prev['selection_reason']='精华规则暂未入选'; prev['local_path']=''
+                        if profile in ('essence','standard') and str(rec.get('aweme_id')) not in selected_ids:
+                            prev['download_status']='未选择（筛选范围外）'; prev['selection_reason']=('精华' if profile=='essence' else '标准')+'规则暂未入选'; prev['local_path']=''
                             known[rec['aweme_id']]=prev
                             continue
+                        if profile in ('essence','standard'):
+                            prev['selection_reason']=('精华规则 v2 入选' if profile=='essence' else '标准规则入选（按博主数量/播放量放宽）')
                         status,path=_download_aweme(prev,folder,ctx)
                         prev['download_status']=status; prev['local_path']=path if status=='已下载' or status=='已存在' else ''
                         if status=='下载失败': prev['download_error']=path
@@ -649,13 +736,13 @@ def _harvest_worker(resume=False):
                     state['errors'].append({'creator':creator.get('name'),'url':creator.get('url'),'error':str(exc)}); state['creator_done']=idx; _save_harvest_state(state)
         def reconcile_essence(ctx):
             """Recheck the final metadata and download any newly selected items."""
-            if not essence_only: return
+            if profile not in ('essence','standard'): return
             groups={}
             for rec in known.values():
                 groups.setdefault(rec.get('creator_url') or rec.get('creator') or '未知博主',[]).append(rec)
             state['phase']='复核精华清单并补下载'; _save_harvest_state(state)
             for group, items in groups.items():
-                ids=_essence_aweme_ids(items)
+                ids=_essence_aweme_ids(items) if profile=='essence' else _standard_aweme_ids(items)
                 creator=items[0].get('creator') or '未知博主'
                 folder=HARVEST_DIR/(re.sub(r'[\\/:*?"<>|]','_',creator)+'__'+hashlib.sha1(str(group).encode()).hexdigest()[:8]); folder.mkdir(parents=True,exist_ok=True)
                 for rec in items:
@@ -726,11 +813,58 @@ def clear_harvest_data():
 def harvest_clear_status():
     with HARVEST_CLEAR_LOCK: return dict(HARVEST_CLEAR_STATUS)
 
+def repair_duplicate_archives():
+    """Quarantine works whose recorded author differs from the folder owner."""
+    stamp=time.strftime('%Y%m%d_%H%M%S')
+    quarantine=LIB/'虚拟回收站'/f'归属修复_{stamp}'
+    report=[]; moved=0; changed=0
+    for manifest in HARVEST_DIR.glob('*/主页作品.json'):
+        try: rows=json.loads(manifest.read_text(encoding='utf-8'))
+        except Exception: continue
+        if not isinstance(rows,list): continue
+        folder_owner=_creator_id_from_url(str(rows[0].get('creator_url') or '')) if rows else ''
+        if not folder_owner: continue
+        keep=[]; bad=[]
+        for row in rows:
+            author=str(row.get('creator_sec_uid') or '').strip()
+            if author and author!=folder_owner: bad.append(row)
+            else: keep.append(row)
+        if not bad: continue
+        changed+=1
+        target_dir=quarantine/manifest.parent.name
+        target_dir.mkdir(parents=True,exist_ok=True)
+        for row in bad:
+            aid=str(row.get('aweme_id') or '')
+            if not aid: continue
+            for candidate in manifest.parent.glob(aid+'.*'):
+                try:
+                    dest=target_dir/candidate.name
+                    if dest.exists(): dest=target_dir/(candidate.stem+'_'+uuid.uuid4().hex[:6]+candidate.suffix)
+                    shutil.move(str(candidate),str(dest)); moved+=1
+                    report.append({'folder':manifest.parent.name,'aweme_id':aid,'source':str(candidate),'quarantine':str(dest),'creator':row.get('creator',''),'actual_author_sec_uid':author})
+                except Exception as exc:
+                    report.append({'folder':manifest.parent.name,'aweme_id':aid,'error':str(exc)})
+        manifest.write_text(json.dumps(keep,ensure_ascii=False,indent=2),encoding='utf-8')
+    quarantine.mkdir(parents=True,exist_ok=True)
+    (quarantine/'修复报告.json').write_text(json.dumps({'created_at':time.strftime('%Y-%m-%d %H:%M:%S'),'folders_changed':changed,'files_moved':moved,'items':report},ensure_ascii=False,indent=2),encoding='utf-8')
+    return {'ok':True,'message':f'归属修复完成：检查并更新 {changed} 个文件夹，移入虚拟回收站 {moved} 个文件。','quarantine':str(quarantine),'folders_changed':changed,'files_moved':moved}
+
 def start_harvest(options=None):
     global HARVEST_THREAD
     with HARVEST_LOCK:
         state=_load_harvest_state()
-        if options is not None: state['essence_only']=bool(options.get('essence_only'))
+        if options is not None:
+            profile=str(options.get('download_profile') or ('essence' if options.get('essence_only') else 'all'))
+            if profile not in ('essence','standard','all'): profile='essence'
+            state['download_profile']=profile
+            state['essence_only']=profile=='essence'
+            state['harvest_mode']=str(options.get('mode') or 'incremental')
+            if state['harvest_mode'] in ('incremental','standard','full'):
+                # A new web run rescans all creators while retaining works,
+                # metrics and download history. Existing files are skipped.
+                state['creator_done']=0
+                state['creator_records']=[dict(x,status='待更新',errors=0) for x in state.get('creator_records',[])]
+                state['snapshot_requested']=True
         if state.get('status')=='运行中' and HARVEST_THREAD is not None and HARVEST_THREAD.is_alive(): return {'ok':True,'message':'采集任务已经在运行。'}
         HARVEST_PAUSE.clear(); HARVEST_STOP.clear(); state['status']='运行中'; state['fatal_error']=''; _save_harvest_state(state)
         HARVEST_THREAD=threading.Thread(target=_harvest_worker,args=(bool(state.get('creators') and state.get('creator_done')) ,),daemon=True); HARVEST_THREAD.start()
@@ -768,6 +902,7 @@ def discover_video_urls(homepage_url, creator=None):
             try:
                 payload=response.json()
                 for aweme in _walk_awemes(payload):
+                    if creator and not _aweme_belongs_to_creator(aweme,creator): continue
                     rec=_aweme_record(aweme,creator or {'name':'','url':homepage_url})
                     if rec.get('aweme_id'): found[rec['aweme_id']]=rec
             except Exception: pass
@@ -934,11 +1069,15 @@ class Handler(BaseHTTPRequestHandler):
                 token=secrets.token_urlsafe(24); DOWNLOADER_SESSIONS[token]=time.time(); reply(self,{'ok':True,'token':token}); return
             reply(self,{'error':'管理密码错误'},401); return
         if u.path=='/api/login': reply(self,open_login()); return
-        if u.path in ('/api/harvest','/api/harvest-control','/api/harvest-clear','/api/harvest-backlog-download','/api/creators/bulk','/api/bulk-download','/api/creators','/api/creators-export','/api/creators-clear','/api/tasks','/api/run') and not _admin_ok(self):
+        if u.path in ('/api/harvest','/api/harvest-control','/api/harvest-clear','/api/harvest-repair-duplicates','/api/harvest-backlog-download','/api/creators/bulk','/api/bulk-download','/api/creators','/api/creators-export','/api/creators-clear','/api/tasks','/api/run') and not _admin_ok(self):
             reply(self,{'error':'需要管理模式，请先输入管理密码'},403); return
         if u.path=='/api/harvest': reply(self,start_harvest(d)); return
         if u.path=='/api/harvest-control': reply(self,control_harvest(str(d.get('action') or ''))); return
         if u.path=='/api/harvest-clear': reply(self,clear_harvest_data()); return
+        if u.path=='/api/harvest-repair-duplicates':
+            try: reply(self,repair_duplicate_archives())
+            except Exception as e: reply(self,{'error':str(e)},500)
+            return
         if u.path=='/api/harvest-backlog-download': reply(self,start_backlog_download()); return
         if u.path=='/api/creators/bulk':
             _,added=save_creator_items(d.get('items')); reply(self,{'ok':True,'added':added,'message':f'已保存 {added} 个新博主。'}); return
