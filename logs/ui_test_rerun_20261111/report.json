@@ -1,0 +1,82 @@
+{
+  "steps": [
+    {
+      "name": "管理模式登录",
+      "message": "管理模式已开启"
+    },
+    {
+      "name": "检查登录状态",
+      "message": "已检测到登录状态。"
+    },
+    {
+      "name": "打开普通Edge抖音网页",
+      "message": "已打开独立抖音登录窗口，请用手机扫码；完成后点击“检查登录状态”。"
+    },
+    {
+      "name": "读取我的关注",
+      "count": 7,
+      "message": "读取到 7 个关注博主（页面显示总数 7）。已到列表末尾。"
+    }
+  ],
+  "console_errors": [],
+  "page_errors": [],
+  "http_errors": [],
+  "screenshots": [
+    "E:\\抖音企划\\logs\\ui_test_rerun_20261111\\01_initial.png",
+    "E:\\抖音企划\\logs\\ui_test_rerun_20261111\\03_follow_list.png",
+    "E:\\抖音企划\\logs\\ui_test_rerun_20261111\\04_after_batch_download.png"
+  ],
+  "title": "独立下载调试器",
+  "button_count": 18,
+  "buttons": [
+    "进入管理模式",
+    "退出管理模式",
+    "打开抖音扫码登录",
+    "检查登录状态",
+    "读取我的关注",
+    "读取我的粉丝",
+    "全选当前列表",
+    "保存选中博主",
+    "保存选中并批量下载",
+    "开始采集并下载",
+    "暂停",
+    "继续",
+    "停止并保存断点",
+    "重试失败博主",
+    "刷新进度",
+    "打开 Excel",
+    "保存博主",
+    "创建并开始"
+  ],
+  "input_count": 6,
+  "select_count": 3,
+  "follow_count": 7,
+  "selected_first5": 5,
+  "selected_names": [
+    " 快乐街区电玩官方\nhttps://www.douyin.com/user/MS4wLjABAAAAEZVA25vIp5-WYMhIe3BnBtueZOO7yq_3lnNPGx8eWLEDCFd-_TT3k93TZyQQsLqK",
+    " 农村小青\nhttps://www.douyin.com/user/MS4wLjABAAAAprHua5KLA9WOmmA9RjSpZNlt2kS5aMzmnPsKqaLdG6QUm9Rsrckuksryt5By1PQg",
+    " 我是小呆\nhttps://www.douyin.com/user/MS4wLjABAAAAlDKRAofgvEyq5-ePAh04E8X-L07Nm1uZK8qE5VGafBurwa2RNH_pe57SaUg3lQhG",
+    " 简艺木雕工作室\nhttps://www.douyin.com/user/MS4wLjABAAAAJMBR_MF5SzCK5Tl5l48ATQAxw-kAaZF2CBJ_fBHWxqHiIr7D9fu_TIOF6sIfHJ3c",
+    " 三农英姐\nhttps://www.douyin.com/user/MS4wLjABAAAAqqcbyziu258HrGwDLdX-UpEEoSB22HhN6_GQFNfb3YY"
+  ],
+  "download_message": "读取到 7 个关注博主（页面显示总数 7）。已到列表末尾。",
+  "batch_fix": {
+    "async_endpoint": true,
+    "tasks_created": 5,
+    "task_ids": [
+      "debug_20261111_165101_a6d19e",
+      "debug_20261111_165121_ab8204",
+      "debug_20261111_165137_1d3bc9",
+      "debug_20261111_165153_4341cb",
+      "debug_20261111_165210_1e410b"
+    ],
+    "logs_completed": true
+  },
+  "fixed_state": {
+    "status": "暂停",
+    "running": false,
+    "phase": "已暂停（服务重启或线程已结束）",
+    "creator_done": 122,
+    "creator_total": 342
+  }
+}
