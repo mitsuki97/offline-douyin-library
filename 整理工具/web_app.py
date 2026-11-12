@@ -137,14 +137,19 @@ class Handler(BaseHTTPRequestHandler):
                 mode=parse_qs(u.query).get('mode',['recommend'])[0]
                 page=max(0,int(parse_qs(u.query).get('page',['0'])[0] or 0))
                 limit=min(30,max(1,int(parse_qs(u.query).get('limit',['12'])[0] or 12)))
-                order={'random':'random()','creator':'f.creator_id,random()','recommend':'random()'}.get(mode,'random()')
+                order={'random':'random()','creator':'f.creator_id,random()','recommend':'''(
+                    select count(*) from feedback lb
+                    where lb.event_type='like' and json_extract(lb.extra_json,'$.creator_id')=coalesce(f.creator_id,'')
+                ) desc, random()'''} .get(mode,'random()')
                 sql=f'''select f.id file_id,f.work_id,f.creator_id,f.current_path,f.status,w.title,coalesce(cr.name,'博主待确认') creator,m.duration,
                     case when ?='creator' then '博主轮播' when ?='random' then '随机探索' else '本地推荐' end reason
                     from files f left join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
                     where f.kind='video' and f.status!='已永久删除' and f.duplicate_of is null
                     and coalesce(m.status,'') not in ('仅音频，扩展名为MP4','下载未完成','无法抽帧','检查失败')
-                    and not exists(select 1 from feedback b where b.event_type='block_video' and b.extra_json like '%"file_id":"'||f.id||'"%')
-                    and not exists(select 1 from feedback b where b.event_type='block_creator' and b.extra_json like '%"creator_id":"'||coalesce(f.creator_id,'')||'"%')
+                    and not exists(select 1 from feedback b where b.event_type='block_video' and json_extract(b.extra_json,'$.file_id')=f.id)
+                    and not exists(select 1 from feedback b where b.event_type='block_creator' and json_extract(b.extra_json,'$.creator_id')=coalesce(f.creator_id,''))
+                    and not exists(select 1 from feedback b where b.event_type in ('dislike','dislike_video') and json_extract(b.extra_json,'$.file_id')=f.id)
+                    and not exists(select 1 from feedback b where b.event_type='dislike_creator' and json_extract(b.extra_json,'$.creator_id')=coalesce(f.creator_id,''))
                     order by {order} limit ? offset ?'''
                 self.send_json(rows(c,sql,(mode,mode,limit,page*limit))); return
             if u.path=='/api/similar': self.send_json(rows(c,'select * from similar order by score desc')); return
