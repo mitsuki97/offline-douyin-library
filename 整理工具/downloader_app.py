@@ -12,10 +12,14 @@ LIB=BASE/'本地视频库'
 ROOT=LIB/'下载器'; ROOT.mkdir(parents=True,exist_ok=True)
 CREATORS=ROOT/'creators.json'; TASKS=LIB/'更新任务'; TASKS.mkdir(parents=True,exist_ok=True)
 HOST=os.environ.get('DOUYIN_DOWNLOADER_HOST','127.0.0.1'); PORT=int(os.environ.get('DOUYIN_DOWNLOADER_PORT','8766')); JOBS={}; BROWSER=None; PLAYWRIGHT=None; BROWSER_THREAD=None; BROWSER_QUEUE=queue.Queue(); LOGIN_LOCK=threading.Lock()
+DOWNLOAD_WORKERS=max(1,min(5,int(os.environ.get('DOUYIN_DOWNLOAD_WORKERS','3'))))
 LOGIN_BROWSER=None; LOGIN_CONTEXT=None; LOGIN_PLAYWRIGHT=None; LOGIN_PROCESS=None; LOGIN_THREAD=None; LOGIN_QUEUE=queue.Queue(); LOGIN_READY=threading.Event(); INTERACTIVE_LOCK=threading.Lock()
 HARVEST_DIR=LIB/'关注归档'; HARVEST_DIR.mkdir(parents=True,exist_ok=True)
 HARVEST_STATE=HARVEST_DIR/'采集进度.json'; HARVEST_LOCK=threading.Lock(); HARVEST_WRITE_LOCK=threading.RLock(); HARVEST_THREAD=None
 HARVEST_DB=HARVEST_DIR/'采集索引.sqlite3'; HARVEST_DATA=HARVEST_DIR/'数据'
+# JSON is the live checkpoint store. The existing SQLite file is retained as
+# a historical export, but normal harvesting no longer opens or writes it.
+HARVEST_JSON_ONLY=True
 HARVEST_PAUSE=threading.Event(); HARVEST_STOP=threading.Event(); DOWNLOADER_SESSIONS={}
 HARVEST_CLEAR_LOCK=threading.RLock(); HARVEST_CLEAR_THREAD=None; HARVEST_CLEAR_STATUS={'status':'空闲','message':'','backup':'','removed':0}
 BACKLOG_THREAD=None; BACKLOG_LOCK=threading.RLock(); BACKLOG_STATUS={'status':'空闲','message':'','done':0,'total':0,'failed':0}
@@ -56,7 +60,7 @@ PAGE='''<!doctype html><meta charset="utf-8"><meta name="viewport" content="widt
 <h1>独立下载控制台</h1><p class="muted">局域网监控与控制关注采集、主页解析、视频下载和 Excel 导出。只读查看无需密码，管理操作需要登录。</p>
 <section class="panel"><h2>管理权限</h2><form id="adminForm" onsubmit="event.preventDefault();adminLogin()"><input id="adminPw" type="password" autocomplete="current-password" placeholder="管理密码"><button type="submit">进入管理模式</button><button type="button" onclick="adminLogout()">退出管理模式</button></form><span id="authmsg" class="muted">当前为只读模式</span></section>
 <section class="panel"><h2>扫码登录与关系列表</h2><p class="muted">点击后会打开独立 Edge 窗口，在抖音页面扫码登录。账号密码不会写入本程序。</p><button onclick="login()">打开抖音扫码登录</button><button onclick="status()">检查登录状态</button><button onclick="follows()">读取我的关注</button><button onclick="fans()">读取我的粉丝</button><button onclick="selectAll()">全选当前列表</button><button onclick="saveSelected()">保存选中博主</button><button onclick="saveAndDownload()">保存选中并批量下载</button><p id="loginmsg" class="muted"></p><p id="batchmsg" class="muted"></p><div id="batchProgress"></div><div id="followList"></div></section>
-<section class="panel"><h2>一次性采集全部关注博主</h2><p class="muted">读取全部关注主页中的可见视频和公开播放量、点赞量，逐博主保存进度；结束后生成总 Excel。视频下载到“关注归档”下的博主目录。访问受限或数据不可见时会保留状态并继续其他博主。</p><label>下载范围：<select id="downloadProfile"><option value="essence">精华视频（点赞靠前、近期和高播放）</option><option value="standard">标准视频（按博主数量和播放量自适应放宽）</option></select></label><span class="muted"> 标准档：作品少的博主基本全下，播放量整体偏低的博主降低门槛，并保留每位博主至少 10 条候选。</span><button onclick="startHarvest('incremental')">增量更新（新博主/新视频）</button><button onclick="startHarvest('standard')">标准更新（含近期统计）</button><button onclick="startHarvest('full')">完整复核</button><button onclick="startBacklog()">下载待下载清单（刷新 CDN）</button><button class="warn" onclick="controlHarvest('pause')">暂停</button><button onclick="controlHarvest('resume')">继续</button><button class="dangerbtn" onclick="controlHarvest('stop')">停止并保存断点</button><button onclick="controlHarvest('retry')">重试失败博主</button><button onclick="harvestStatus()">刷新进度</button><button onclick="openWorkbook()">打开 Excel</button><a href="/api/harvest-backlog-file">下载待下载 CSV</a><button class="dangerbtn" onclick="clearHarvest()">清空采集进度和内容</button><button class="warn" onclick="repairDuplicates()">扫描并移入错误归属视频</button><p id="harvestmsg" class="muted"></p><div id="harvest"></div><div class="stats" id="harvestStats"></div><h3>博主进度</h3><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>状态/阶段</th><th>进度</th><th>作品</th><th>已下载</th><th>失败</th><th>主页</th></tr></thead><tbody id="creatorProgress"></tbody></table></div><h3>采集结果</h3><div class="toolbar"><input id="workSearch" placeholder="搜索博主、标题或作品ID" oninput="loadWorks()"><select id="workStatus" onchange="loadWorks()"><option value="">全部状态</option><option>已下载</option><option>已存在</option><option>无媒体地址</option><option>下载失败</option></select></div><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>标题</th><th>播放量</th><th>点赞量</th><th>发布时间</th><th>下载状态</th><th>链接</th></tr></thead><tbody id="workRows"></tbody></table></div></section>
+<section class="panel"><h2>一次性采集全部关注博主</h2><p class="muted">读取全部关注主页中的可见视频和公开播放量、点赞量，逐博主保存进度；结束后生成总 Excel。视频下载到“关注归档”下的博主目录。访问受限或数据不可见时会保留状态并继续其他博主。</p><label>下载范围：<select id="downloadProfile"><option value="essence">精华视频（点赞靠前、近期和高播放）</option><option value="standard">标准视频（按博主数量和播放量自适应放宽）</option></select></label><span class="muted"> 标准档：作品少的博主基本全下，播放量整体偏低的博主降低门槛，并保留每位博主至少 10 条候选。</span><button onclick="startHarvest('incremental')">增量更新（新博主/新视频）</button><button onclick="startHarvest('standard')">标准更新（含近期统计）</button><button onclick="startHarvest('full')">完整复核</button><button onclick="startBacklog()">下载待下载清单（刷新 CDN）</button><button class="warn" onclick="controlHarvest('pause')">暂停</button><button onclick="controlHarvest('resume')">继续</button><button class="dangerbtn" onclick="controlHarvest('stop')">停止并保存断点</button><button onclick="controlHarvest('retry')">重试失败博主</button><button onclick="harvestStatus()">刷新进度</button><button onclick="openWorkbook()">打开 Excel</button><a href="/api/harvest-backlog-file">下载待下载 CSV</a><button class="dangerbtn" onclick="clearHarvest()">清空采集进度和内容</button><button class="warn" onclick="repairDuplicates()">扫描并移入错误归属视频</button><p id="harvestmsg" class="muted"></p><div id="harvest"></div><div class="stats" id="harvestStats"></div><h3>博主进度</h3><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>状态</th><th>作品</th><th>已下载</th><th>失败</th><th>主页</th></tr></thead><tbody id="creatorProgress"></tbody></table></div><h3>采集结果</h3><div class="toolbar"><input id="workSearch" placeholder="搜索博主、标题或作品ID" oninput="loadWorks()"><select id="workStatus" onchange="loadWorks()"><option value="">全部状态</option><option>已下载</option><option>已存在</option><option>无媒体地址</option><option>下载失败</option></select></div><div class="scroll"><table class="table"><thead><tr><th>博主</th><th>标题</th><th>播放量</th><th>点赞量</th><th>发布时间</th><th>下载状态</th><th>链接</th></tr></thead><tbody id="workRows"></tbody></table></div></section>
 <section class="panel"><h2>导入博主</h2><input id="name" placeholder="博主名称"><input id="url" style="width:420px" placeholder="博主主页链接"><button onclick="add()">保存博主</button><button onclick="exportCreators()">导出全部博主 Excel</button><button class="dangerbtn" onclick="clearCreators()">清空所有博主</button><div id="list"></div></section>
 <section class="panel"><h2>创建测试下载</h2><select id="creator"></select><input id="date" type="date"><select id="login"><option value="edge" selected>使用 Edge 登录状态</option><option value="">不使用登录</option><option value="chrome">使用 Chrome 登录状态</option><option value="firefox">使用 Firefox 登录状态</option><option value="file">使用 Cookie 文件</option></select><input id="cookie" style="width:360px" placeholder="Cookie 文件完整路径（仅选择文件时填写）"><button onclick="make()">创建并开始</button><p id="msg" class="muted"></p></section>
 <section class="panel"><h2>任务状态</h2><div id="jobs">暂无任务</div></section>
@@ -75,7 +79,7 @@ async function controlHarvest(action){try{let r=await api('/api/harvest-control'
 function openWorkbook(){window.open('/api/harvest-file','_blank')}
 async function clearHarvest(){if(!confirm('确定清空之前的采集进度和采集内容吗？系统会先完整备份“关注归档”，不会删除博主列表、待导入视频或下载任务。'))return;try{let r=await api('/api/harvest-clear',{method:'POST',body:'{}'});$('#harvestmsg').textContent=r.message||'已开始清空并备份';harvestStatus()}catch(e){$('#harvestmsg').textContent='清空失败：'+e.message}}
 async function repairDuplicates(){if(!confirm('将按作品作者 ID 校验每个博主文件夹，并把错误归属文件移入虚拟回收站。不会永久删除。继续？'))return;try{let r=await api('/api/harvest-repair-duplicates',{method:'POST',body:'{}'});$('#harvestmsg').textContent=r.message||r.error;harvestStatus()}catch(e){$('#harvestmsg').textContent='归属修复失败：'+e.message}}
-async function harvestStatus(){try{let r=await api('/api/harvest-status');$('#harvestmsg').textContent=r.message||r.error||'';$('#harvest').textContent=r.summary||'';let pct=r.creator_total?Math.round(100*r.creator_done/r.creator_total):0;$('#harvestStats').innerHTML=[['博主进度',r.creator_done+'/'+r.creator_total],['作品记录',r.work_count],['已验证作品',r.verified_work_count||0],['未验证链接',r.unverified_link_count||0],['已读取点赞量',r.digg_count],['已验证作品缺失点赞',r.verified_digg_missing||0],['有媒体链接',r.media_url_count||0],['已下载',r.downloaded],['错误',r.error_count]].map(x=>`<div class="stat">${esc(x[0])}<b>${esc(x[1])}</b></div>`).join('')+`<div class="stat">总进度<b>${pct}%</b><div class="bar"><i style="width:${pct}%"></i></div></div>`;$('#creatorProgress').innerHTML=(r.creator_records||[]).map(x=>{let p=Math.max(0,Math.min(100,Number(x.progress||0)));return `<tr><td>${esc(x.name)}</td><td>${esc(x.status||'')}${x.phase?`<br><span class=\"muted\">${esc(x.phase)}</span>`:''}</td><td><div class=\"bar\"><i style=\"width:${p}%\"></i></div><span class=\"muted\">${p}%</span></td><td>${x.works||0}</td><td>${x.downloaded||0}</td><td>${x.errors||0}</td><td><a href=\"${esc(x.url)}\" target=\"_blank\">打开</a></td></tr>`}).join('');loadWorks();if(r.running)setTimeout(harvestStatus,3000)}catch(e){$('#harvestmsg').textContent=e.message}}
+async function harvestStatus(){try{let r=await api('/api/harvest-status');$('#harvestmsg').textContent=r.message||r.error||'';$('#harvest').textContent=r.summary||'';let pct=r.creator_total?Math.round(100*r.creator_done/r.creator_total):0;$('#harvestStats').innerHTML=[['博主进度',r.creator_done+'/'+r.creator_total],['作品记录',r.work_count],['已验证作品',r.verified_work_count||0],['未验证链接',r.unverified_link_count||0],['已读取点赞量',r.digg_count],['已验证作品缺失点赞',r.verified_digg_missing||0],['有媒体链接',r.media_url_count||0],['已下载',r.downloaded],['错误',r.error_count]].map(x=>`<div class="stat">${esc(x[0])}<b>${esc(x[1])}</b></div>`).join('')+`<div class="stat">总进度<b>${pct}%</b><div class="bar"><i style="width:${pct}%"></i></div></div>`;$('#creatorProgress').innerHTML=(r.creator_records||[]).map(x=>`<tr><td>${esc(x.name)}</td><td>${esc(x.status)}</td><td>${x.works||0}</td><td>${x.downloaded||0}</td><td>${x.errors||0}</td><td><a href="${esc(x.url)}" target="_blank">打开</a></td></tr>`).join('');loadWorks();if(r.running)setTimeout(harvestStatus,3000)}catch(e){$('#harvestmsg').textContent=e.message}}
 async function loadWorks(){try{let q=new URLSearchParams({q:$('#workSearch').value||'',status:$('#workStatus').value||'',limit:'200'});let r=await api('/api/harvest-works?'+q.toString());$('#workRows').innerHTML=(r.items||[]).map(x=>`<tr><td>${esc(x.creator)}</td><td>${esc(x.title||x.aweme_id)}</td><td>${x.play_count??''}</td><td>${x.digg_count??''}</td><td>${esc(x.publish_time||'')}</td><td>${esc(x.download_status||'')}</td><td><a href="${esc(x.url)}" target="_blank">作品页</a></td></tr>`).join('')||'<tr><td colspan="7">暂无数据</td></tr>'}catch(e){}}
 let relationItems=[];
 function renderRelation(items){relationItems=items||[];$('#followList').innerHTML=relationItems.map((x,i)=>`<div class="item"><label><input class="relbox" type="checkbox" data-i="${i}"> <b>${esc(x.name)}</b></label><br><span class="muted">${esc(x.url)}</span></div>`).join('')||'<p class="muted">暂未读取到列表；请先扫码登录。</p>'}
@@ -234,6 +238,12 @@ def open_login():
         # persistent context opens the QR login page without waiting for the
         # long-running harvest context.
         ensure_interactive_browser()
+        # Do not report success until the worker has actually connected to
+        # the isolated visible Edge instance.  The old asynchronous call
+        # could return "已打开" even when Edge failed to start.
+        if not LOGIN_READY.wait(25):
+            raise RuntimeError('独立 Edge 启动超时（9227 端口未就绪）')
+        interactive_browser_call(lambda ctx: (ctx.pages[0].bring_to_front() if ctx.pages else ctx.new_page().bring_to_front()), timeout=15)
         return {'ok':True,'message':'已打开独立抖音登录窗口，请用手机扫码；完成后点击“检查登录状态”。'}
     except Exception as e: return {'error':f'无法打开登录窗口：{e}'}
 
@@ -379,18 +389,63 @@ def _load_harvest_state():
     try: return json.loads(HARVEST_STATE.read_text(encoding='utf-8'))
     except Exception: return {'status':'空闲','creators':[],'works':[],'errors':[],'updated_at':''}
 
+def _save_json_mirrors(state):
+    """Write the readable mirrors without touching SQLite."""
+    HARVEST_DATA.mkdir(parents=True,exist_ok=True)
+    mirrors={
+        'creators.json':state.get('creators',[]),
+        'works.json':state.get('works',[]),
+        'updates.json':state.get('updates',[]),
+        'rules.json':{
+            '精华-v2':{'description':'分层点赞百分位+近期3条+播放量8000+中位数3倍'},
+            '标准-v1':{'description':'按博主作品量分层配额；低播放博主降低播放门槛；近期10条；每位博主至少10条'}
+        },
+        'state.json':state,
+    }
+    for name,obj in mirrors.items():
+        target=HARVEST_DATA/name
+        tmp=target.with_name(target.stem+f'.{os.getpid()}.tmp')
+        tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
+        for attempt in range(8):
+            try: tmp.replace(target); break
+            except OSError:
+                if attempt==7: raise
+                time.sleep(0.15*(attempt+1))
+
 def _save_harvest_state(state):
     with HARVEST_WRITE_LOCK:
         state['updated_at']=time.strftime('%Y-%m-%d %H:%M:%S')
         # SQLite and the readable JSON mirrors are updated before the legacy
         # aggregate state file. A failure here is recorded but never hides the
         # harvest checkpoint itself.
-        try:
-            db_snapshot,snapshot=sync_harvest_store(state,HARVEST_DB,HARVEST_DATA)
-            state['dual_store']={'sqlite':str(HARVEST_DB),'json_dir':str(HARVEST_DATA),'last_sqlite_snapshot':db_snapshot,'last_json_snapshot':snapshot,'synced_at':state['updated_at']}
-        except Exception as exc:
-            state.setdefault('errors',[]).append({'creator':'双存储同步','error':str(exc)})
-        tmp=HARVEST_STATE.with_suffix('.tmp'); tmp.write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8'); tmp.replace(HARVEST_STATE)
+        if HARVEST_JSON_ONLY:
+            state['dual_store']={'mode':'json-only','sqlite':str(HARVEST_DB),'json_dir':str(HARVEST_DATA),'last_sqlite_snapshot':'','last_json_snapshot':'','synced_at':state['updated_at']}
+            _save_json_mirrors(state)
+        else:
+            try:
+                db_snapshot,snapshot=sync_harvest_store(state,HARVEST_DB,HARVEST_DATA)
+                state['dual_store']={'mode':'dual','sqlite':str(HARVEST_DB),'json_dir':str(HARVEST_DATA),'last_sqlite_snapshot':db_snapshot,'last_json_snapshot':snapshot,'synced_at':state['updated_at']}
+            except Exception as exc:
+                state.setdefault('errors',[]).append({'creator':'双存储同步','error':str(exc)})
+        # Windows may briefly deny replacing a file that is being indexed or
+        # read by the web UI. Use a per-process temp file and retry the atomic
+        # replace so a transient sharing violation cannot kill the harvest.
+        payload=json.dumps(state,ensure_ascii=False,indent=2)
+        tmp=HARVEST_STATE.with_name(HARVEST_STATE.stem+f'.{os.getpid()}.tmp')
+        tmp.write_text(payload,encoding='utf-8')
+        last_exc=None
+        for attempt in range(8):
+            try:
+                tmp.replace(HARVEST_STATE); last_exc=None; break
+            except OSError as exc:
+                last_exc=exc; time.sleep(0.25*(attempt+1))
+        if last_exc is not None:
+            # Preserve the checkpoint even if another process holds the live
+            # file; the next service start can recover this sidecar.
+            fallback=HARVEST_STATE.with_name(HARVEST_STATE.stem+'.recovery.json')
+            try: tmp.replace(fallback)
+            except Exception: pass
+            raise last_exc
         _write_download_backlog(state)
 
 def _write_download_backlog(state):
@@ -419,6 +474,26 @@ def _write_download_backlog(state):
 
 def harvest_status():
     state=_load_harvest_state(); status=state.get('status','空闲'); works=state.get('works',[])
+    # Backfill creator status for records written by the earlier pipeline,
+    # which left completed downloads at "采集完成（下载中）".
+    try:
+        groups={}
+        for w in works: groups.setdefault(w.get('creator_url') or w.get('creator'),[]).append(w)
+        corrected=False
+        terminal={'已下载','已存在','下载失败','无媒体地址','绝版-作品已删除','绝版-待人工确认'}
+        for rec in state.get('creator_records',[]):
+            if rec.get('status')!='采集完成（下载中）': continue
+            items=groups.get(rec.get('url') or rec.get('name'),[])
+            selected=[w for w in items if str(w.get('download_status')) not in ('未选择（筛选范围外）','未验证链接（仅保留链接）')]
+            if not selected or any(str(w.get('download_status')) not in terminal for w in selected): continue
+            done=sum(w.get('download_status') in ('已下载','已存在') for w in selected)
+            failed=len(selected)-done
+            rec.update(status='完成（有告警）' if failed else '完成',phase='已完成',progress=100,downloaded=done,errors=failed,download_total=len(selected),download_phase=f'完成 {done}/{len(selected)}')
+            corrected=True
+        if corrected:
+            state['works']=works; _save_harvest_state(state)
+    except Exception:
+        pass
     alive=HARVEST_THREAD is not None and HARVEST_THREAD.is_alive()
     if status=='运行中' and not alive:
         status='暂停'; state['status']='暂停'; state['phase']='已暂停（服务重启或线程已结束）'; _save_harvest_state(state)
@@ -452,7 +527,7 @@ def _harvest_checkpoint(state):
     if HARVEST_STOP.is_set(): raise HarvestStopped()
     if state.get('status')=='暂停': state['status']='运行中'; _save_harvest_state(state)
 
-def _collect_creator_all(ctx, creator, progress=None):
+def _collect_creator_all(ctx, creator):
     page=ctx.pages[0] if ctx.pages else ctx.new_page(); found={}; more={'value':True}; last_error=[]
     def on_response(response):
         u=response.url.lower()
@@ -475,19 +550,14 @@ def _collect_creator_all(ctx, creator, progress=None):
         except Exception as exc: last_error.append(str(exc))
     page.on('response',on_response)
     try:
-        if progress: progress(5,'打开博主主页')
         page.goto(creator['url'],wait_until='domcontentloaded',timeout=45000); page.bring_to_front(); page.wait_for_timeout(5000)
         for label in ('作品','视频','Posts'):
             try:
                 loc=page.get_by_text(label,exact=True).last
-                if loc.is_visible(timeout=700):
-                    if progress: progress(10,'打开作品列表')
-                    loc.click(); page.wait_for_timeout(2500); break
+                if loc.is_visible(timeout=700): loc.click(); page.wait_for_timeout(2500); break
             except Exception: pass
         unchanged=0; prior=-1; bottom_stalls=0
         for _ in range(5000):
-            loop_no=_
-            if progress and (loop_no % 4 == 0): progress(min(90,12+loop_no//4),'滚动加载作品')
             # Also collect visible links; API response capture remains authoritative for metrics.
             links=page.evaluate("""() => Array.from(document.querySelectorAll('a[href*="/video/"]')).map(a=>a.href||'')""") or []
             for href in links:
@@ -504,7 +574,6 @@ def _collect_creator_all(ctx, creator, progress=None):
             after=page.evaluate('() => document.scrollingElement?.scrollTop || 0')
             bottom_stalls=bottom_stalls+1 if after==before else 0
             if bottom_stalls>=18 and unchanged>=12: break
-        if progress: progress(100,'采集完成，整理作品数据')
         return list(found.values()),('主页未公开完整作品数据' if last_error and not found else '')
     finally:
         try: page.remove_listener('response',on_response)
@@ -529,8 +598,8 @@ def _download_aweme(rec, folder, ctx):
                 errors.append(str(exc)); time.sleep(min(2**attempt,5))
     return '下载失败',errors[-1] if errors else '媒体地址失效'
 
-def _download_aweme_http(rec, folder):
-    """Thread-safe downloader for already refreshed CDN URLs."""
+def _download_aweme_threadsafe(rec, folder):
+    """Download using a plain HTTP request so worker threads never touch Playwright."""
     aid=rec.get('aweme_id') or 'unknown'; target=folder/(aid+'.mp4')
     if target.exists() and target.stat().st_size>0: return '已存在',str(target)
     urls=rec.get('media_urls') or []
@@ -539,15 +608,14 @@ def _download_aweme_http(rec, folder):
     for url in urls[:3]:
         for attempt in range(2):
             try:
-                req=urllib.request.Request(url,headers={'Referer':'https://www.douyin.com/','User-Agent':'Mozilla/5.0'})
-                with urllib.request.urlopen(req,timeout=60) as response:
-                    if getattr(response,'status',200) in (403,429): raise RuntimeError(f'HTTP {response.status}')
+                request=urllib.request.Request(url,headers={'Referer':'https://www.douyin.com/','User-Agent':'Mozilla/5.0'})
+                with urllib.request.urlopen(request,timeout=90) as response:
                     data=response.read()
                 if len(data)<1024: raise RuntimeError(f'响应过小：{len(data)} bytes')
                 tmp=target.with_suffix('.mp4.part'); tmp.write_bytes(data); tmp.replace(target)
                 return '已下载',str(target)
             except Exception as exc:
-                errors.append(str(exc)); time.sleep(min(1.5*(attempt+1),3))
+                errors.append(str(exc)); time.sleep(min(2**attempt,4))
     return '下载失败',errors[-1] if errors else '媒体地址失效'
 
 def _refresh_aweme_media(rec, ctx):
@@ -709,89 +777,90 @@ def _harvest_worker(resume=False):
             if not result.get('ok'): raise RuntimeError(result.get('error') or '读取关注列表失败')
             creators=result.get('items') or []
             state['creators']=creators; state['creator_total']=len(creators); state['creator_done']=0
-            state['creator_records']=[{'name':c.get('name',''),'url':c.get('url',''),'status':'待处理','phase':'等待处理','progress':0,'works':0,'downloaded':0,'errors':0} for c in creators]
+            state['creator_records']=[{'name':c.get('name',''),'url':c.get('url',''),'status':'待处理','works':0,'downloaded':0,'errors':0} for c in creators]
         state['phase']='逐个采集主页'; _save_harvest_state(state)
         if not creators: raise RuntimeError('关注列表读取结果为空；请确认登录状态及关注页面正常显示')
         known={str(w.get('aweme_id')):w for w in state.get('works',[]) if w.get('aweme_id')}
         def collect(ctx):
-            # Keep one download pool alive while the browser moves on to the
-            # next creator. This makes collection and media download overlap.
-            pool=ThreadPoolExecutor(max_workers=5,thread_name_prefix='douyin-download')
-            pending=[]; manifests={}; stats={}
+            # One Playwright page collects creators sequentially. Downloads use
+            # a bounded thread pool and plain urllib, so no browser context is
+            # shared across worker threads.
+            pool=ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS,thread_name_prefix='douyin-download')
+            pending={}; stats={}; last_save=[0]
             def drain(block=False):
-                nonlocal pending
-                remaining=[]
-                for item in pending:
-                    idx,prev,fut=item
-                    if not block and not fut.done(): remaining.append(item); continue
-                    status,path=fut.result(); prev['download_status']=status; prev['local_path']=path if status in ('已下载','已存在') else ''
+                finished=[]
+                for fut,meta in list(pending.items()):
+                    if not block and not fut.done(): continue
+                    try: status,path=fut.result()
+                    except Exception as exc: status,path='下载失败',str(exc)
+                    finished.append(fut)
+                    idx,aid,folder,work_snapshot=meta
+                    prev=known.get(aid,{}); prev.update(work_snapshot)
+                    prev['download_status']=status
+                    prev['local_path']=path if status in ('已下载','已存在') else ''
                     if status=='下载失败': prev['download_error']=path
-                    d=stats.setdefault(idx,{'done':0,'failed':0})
+                    known[aid]=prev
+                    d=stats.setdefault(idx,{'done':0,'failed':0,'total':0,'expected':0})
                     d['done']+=1 if status in ('已下载','已存在') else 0
                     d['failed']+=1 if status in ('下载失败','无媒体地址') else 0
-                pending=remaining
+                    d['total']+=1
+                for fut in finished: pending.pop(fut,None)
+                if finished:
+                    for idx,d in stats.items():
+                        rec=_set_creator_record(state,idx-1,downloaded=d['done'],errors=d['failed'],download_total=d.get('expected',d['total']),download_phase=f'下载中 {d["done"]}/{d.get("expected",d["total"])}')
+                        if d.get('expected',0)>0 and d['done']+d['failed']>=d['expected']:
+                            _set_creator_record(state,idx-1,status='完成（有告警）' if d['failed'] else '完成',phase='已完成',progress=100,download_phase=f'完成 {d["done"]}/{d["expected"]}')
+                    state['works']=list(known.values())
+                    last_save[0]+=len(finished)
+                    if block or last_save[0]>=5:
+                        _save_harvest_state(state); last_save[0]=0
+                return len(finished)
+            try:
+                for idx,creator in enumerate(creators,1):
+                    _harvest_checkpoint(state)
+                    drain(False)
+                    if idx<=int(state.get('creator_done',0)): continue
+                    _set_creator_record(state,idx-1,name=creator.get('name',''),url=creator.get('url',''),status='采集中',works=0,downloaded=0,errors=0)
+                    state['phase']=f"采集 {creator.get('name','')} ({idx}/{len(creators)})"; _save_harvest_state(state)
+                    try:
+                        works,warning=_collect_creator_all(ctx,creator)
+                        folder=HARVEST_DIR/(re.sub(r'[\/:*?"<>|]','_',creator.get('name') or '未知博主')+'__'+hashlib.sha1(creator.get('url','').encode()).hexdigest()[:8]); folder.mkdir(parents=True,exist_ok=True)
+                        for rec in works:
+                            prev=known.get(rec.get('aweme_id'),{}); prev.update(rec); known[rec.get('aweme_id')]=prev
+                        state['works']=list(known.values()); _save_harvest_state(state)
+                        (folder/'主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8')
+                        selected_ids=(_essence_aweme_ids(works) if profile=='essence' else _standard_aweme_ids(works) if profile=='standard' else {str(r.get('aweme_id')) for r in works})
+                        submitted=0
+                        for rec in works:
+                            _harvest_checkpoint(state); aid=str(rec.get('aweme_id') or '')
+                            if not aid: continue
+                            prev=known.get(aid,{}); prev.update(rec)
+                            if not rec.get('verified_aweme',rec.get('read_status')!='仅发现链接，统计待补'):
+                                prev['download_status']='未验证链接（仅保留链接）'; prev['local_path']=''; known[aid]=prev; continue
+                            if profile in ('essence','standard') and aid not in selected_ids:
+                                prev['download_status']='未选择（筛选范围外）'; prev['selection_reason']=('精华' if profile=='essence' else '标准')+'规则暂未入选'; prev['local_path']=''; known[aid]=prev; continue
+                            if profile in ('essence','standard'):
+                                prev['selection_reason']=('精华规则 v2 入选' if profile=='essence' else '标准规则入选（按博主数量/播放量放宽）')
+                            snapshot=dict(prev); fut=pool.submit(_download_aweme_threadsafe,snapshot,folder)
+                            pending[fut]=(idx,aid,folder,snapshot); submitted+=1
+                            stats.setdefault(idx,{'done':0,'failed':0,'total':0,'expected':0})['expected']+=1
+                            if submitted%5==0: drain(False)
+                        state['works']=list(known.values()); state['creator_done']=idx
+                        d=stats.setdefault(idx,{'done':0,'failed':0,'total':0,'expected':0})
+                        _set_creator_record(state,idx-1,status='采集完成（下载中）' if submitted else ('完成（有告警）' if d['failed'] else '完成'),phase='后台下载视频' if submitted else '已完成',progress=100,works=len(works),downloaded=d['done'],errors=d['failed'],download_total=d.get('expected',0))
+                        if warning: state['errors'].append({'creator':creator.get('name'),'error':warning})
+                        (folder/'主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8'); _save_harvest_state(state)
+                    except HarvestStopped:
+                        _set_creator_record(state,idx-1,status='已停止',works=len(works) if 'works' in locals() else 0); _save_harvest_state(state); raise
+                    except Exception as exc:
+                        _set_creator_record(state,idx-1,status='失败',errors=1); state['errors'].append({'creator':creator.get('name'),'url':creator.get('url'),'error':str(exc)}); state['creator_done']=idx; _save_harvest_state(state)
+                while pending: drain(True)
                 for idx,d in stats.items():
                     rec=state.get('creator_records',[{}])[idx-1] if idx-1<len(state.get('creator_records',[])) else {}
-                    _set_creator_record(state,idx-1,downloaded=d['done'],errors=d['failed'])
-                if stats: state['works']=list(known.values()); _save_harvest_state(state)
-            try:
-              for idx,creator in enumerate(creators,1):
-                _harvest_checkpoint(state)
-                if idx<=int(state.get('creator_done',0)): continue
-                _set_creator_record(state,idx-1,name=creator.get('name',''),url=creator.get('url',''),status='采集中',works=0,downloaded=0,errors=0)
-                state['phase']=f"采集 {creator.get('name','')} ({idx}/{len(creators)})"; _save_harvest_state(state)
-                try:
-                    def creator_progress(value, phase):
-                        _set_creator_record(state,idx-1,progress=int(value),phase=phase,status='采集中')
-                        state['phase']=f"{creator.get('name','')}：{phase}（{int(value)}%）"
-                        if int(value)%10==0 or value>=95: _save_harvest_state(state)
-                    works,warning=_collect_creator_all(ctx,creator,creator_progress)
-                    folder=HARVEST_DIR/(re.sub(r'[\\/:*?"<>|]','_',creator.get('name') or '未知博主')+'__'+hashlib.sha1(creator.get('url','').encode()).hexdigest()[:8]); folder.mkdir(parents=True,exist_ok=True)
-                    # Persist the complete metadata/link snapshot before any
-                    # media download starts. A download failure or restart
-                    # must never discard the likes, play counts, and URLs
-                    # already collected for this creator.
-                    for rec in works:
-                        prev=known.get(rec.get('aweme_id'),{})
-                        prev.update(rec)
-                        known[rec.get('aweme_id')]=prev
-                    state['works']=list(known.values()); _save_harvest_state(state)
-                    (folder/'主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8')
-                    done=0; failed=0
-                    selected_ids=(_essence_aweme_ids(works) if profile=='essence' else _standard_aweme_ids(works) if profile=='standard' else {str(r.get('aweme_id')) for r in works})
-                    manifests[idx]=(folder,works)
-                    for rec in works:
-                        _harvest_checkpoint(state)
-                        prev=known.get(rec['aweme_id'],{}); prev.update(rec)
-                        if not rec.get('verified_aweme',rec.get('read_status')!='仅发现链接，统计待补'):
-                            prev['download_status']='未验证链接（仅保留链接）'; prev['local_path']=''; known[rec['aweme_id']]=prev; continue
-                        if profile in ('essence','standard') and str(rec.get('aweme_id')) not in selected_ids:
-                            prev['download_status']='未选择（筛选范围外）'; prev['selection_reason']=('精华' if profile=='essence' else '标准')+'规则暂未入选'; prev['local_path']=''; known[rec['aweme_id']]=prev; continue
-                        if profile in ('essence','standard'):
-                            prev['selection_reason']=('精华规则 v2 入选' if profile=='essence' else '标准规则入选（按博主数量/播放量放宽）')
-                        known[rec['aweme_id']]=prev
-                        pending.append((idx,prev,pool.submit(_download_aweme_http,prev,folder)))
-                    state['works']=list(known.values()); state['creator_done']=idx
-                    _set_creator_record(state,idx-1,status='采集完成（下载中）',phase='后台下载视频',progress=100,works=len(works),downloaded=0,errors=0)
-                    drain(False)
-                    if warning: state['errors'].append({'creator':creator.get('name'),'error':warning})
-                    _save_harvest_state(state)
-                except HarvestStopped:
-                    _set_creator_record(state,idx-1,status='已停止',works=len(works) if 'works' in locals() else 0); _save_harvest_state(state); raise
-                except Exception as exc:
-                    _set_creator_record(state,idx-1,status='失败',errors=1)
-                    state['errors'].append({'creator':creator.get('name'),'url':creator.get('url'),'error':str(exc)}); state['creator_done']=idx; _save_harvest_state(state)
-              while pending:
-                drain(True)
-              for idx,(folder,works) in manifests.items():
-                for row in works:
-                    if row.get('aweme_id') in known: row.update(known[row['aweme_id']])
-                folder.joinpath('主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8')
-                d=stats.get(idx,{'done':0,'failed':0})
-                _set_creator_record(state,idx-1,status='完成（有告警）' if d['failed'] else '完成',phase='已完成',progress=100,works=len(works),downloaded=d['done'],errors=d['failed'])
-              state['works']=list(known.values()); _save_harvest_state(state)
+                    _set_creator_record(state,idx-1,status='完成（有告警）' if d['failed'] else '完成',phase='已完成',progress=100,downloaded=d['done'],errors=d['failed'],download_total=d['total'],download_phase=f'完成 {d["done"]}/{d["total"]}')
+                state['works']=list(known.values()); _save_harvest_state(state)
             finally:
-              pool.shutdown(wait=True)
+                pool.shutdown(wait=True)
         def reconcile_essence(ctx):
             """Recheck the final metadata and download any newly selected items."""
             if profile not in ('essence','standard'): return
