@@ -517,6 +517,56 @@ def _set_creator_record(state, idx, **updates):
     while len(records)<=idx: records.append({})
     records[idx].update(updates)
 
+def _creator_archive_folder(creator):
+    name=re.sub(r'[\\/:*?"<>|]','_',creator.get('name') or '未知博主')
+    return HARVEST_DIR/(name+'__'+hashlib.sha1(str(creator.get('url','')).encode()).hexdigest()[:8])
+
+def retry_non_completed_preview():
+    state=_load_harvest_state()
+    alive=HARVEST_THREAD is not None and HARVEST_THREAD.is_alive()
+    if alive or state.get('status')=='运行中':
+        return {'ok':False,'error':'采集任务仍在运行，请等待结束后再重试。'}
+    records=state.get('creator_records',[]); creators=state.get('creators',[])
+    by_url={str(c.get('url') or ''):c for c in creators}
+    targets=[]
+    works=state.get('works',[])
+    for rec in records:
+        if str(rec.get('status') or '')=='完成': continue
+        url=str(rec.get('url') or '')
+        items=[w for w in works if str(w.get('creator_url') or '')==url]
+        creator=by_url.get(url,{'name':rec.get('name','未知博主'),'url':url})
+        folder=_creator_archive_folder(creator)
+        files=sum(1 for p in folder.glob('*') if p.is_file()) if folder.exists() else 0
+        targets.append({'name':creator.get('name','未知博主'),'url':url,'status':rec.get('status',''),'works':len(items),'files':files})
+    return {'ok':True,'count':len(targets),'items':targets,'download_profile':state.get('download_profile') or ('essence' if state.get('essence_only') else 'all')}
+
+def prepare_retry_non_completed():
+    global HARVEST_THREAD
+    state=_load_harvest_state()
+    if HARVEST_THREAD is not None and HARVEST_THREAD.is_alive(): return {'ok':False,'error':'采集任务仍在运行，请等待结束后再重试。'}
+    records=state.get('creator_records',[]); creators=state.get('creators',[]); by_url={str(c.get('url') or ''):c for c in creators}
+    target_urls={str(r.get('url') or '') for r in records if str(r.get('status') or '')!='完成' and str(r.get('url') or '')}
+    if not target_urls: return {'ok':False,'message':'没有需要重试的博主。','count':0}
+    stamp=time.strftime('%Y%m%d_%H%M%S'); quarantine=LIB/'虚拟回收站'/f'重试_{stamp}'; quarantine.mkdir(parents=True,exist_ok=True)
+    (quarantine/'state_before.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+    old_works=[w for w in state.get('works',[]) if str(w.get('creator_url') or '') in target_urls]
+    (quarantine/'works_before.json').write_text(json.dumps(old_works,ensure_ascii=False,indent=2),encoding='utf-8')
+    moved=[]
+    for url in target_urls:
+        creator=by_url.get(url,{'name':'未知博主','url':url}); folder=_creator_archive_folder(creator)
+        if folder.exists():
+            dest=quarantine/folder.name
+            if dest.exists(): dest=quarantine/(folder.name+'_'+uuid.uuid4().hex[:6])
+            shutil.move(str(folder),str(dest)); moved.append({'source':str(folder),'quarantine':str(dest)})
+    state['works']=[w for w in state.get('works',[]) if str(w.get('creator_url') or '') not in target_urls]
+    state['creator_done']=0; state['retry_only_urls']=sorted(target_urls)
+    state['retry_batch']={'id':f'重试_{stamp}','snapshot':str(quarantine/'works_before.json'),'quarantine':str(quarantine),'started_at':time.strftime('%Y-%m-%d %H:%M:%S'),'moved':moved}
+    for rec in state.get('creator_records',[]):
+        if str(rec.get('url') or '') in target_urls: rec.update(status='待处理',phase='重试准备完成',progress=0,works=0,downloaded=0,errors=0)
+    state['errors']=[]; state['status']='运行中'; state['phase']='重试准备完成，开始采集'; state['fatal_error']=''; _save_harvest_state(state)
+    HARVEST_PAUSE.clear(); HARVEST_STOP.clear(); HARVEST_THREAD=threading.Thread(target=_harvest_worker,args=(True,),daemon=True); HARVEST_THREAD.start()
+    return {'ok':True,'count':len(target_urls),'quarantine':str(quarantine),'message':f'已归档并开始重试 {len(target_urls)} 位非完成博主。'}
+
 class HarvestStopped(Exception): pass
 
 def _harvest_checkpoint(state):
@@ -658,9 +708,10 @@ def _refresh_aweme_media(rec, ctx):
         try: page.remove_listener('response',on_response)
         except Exception: pass
 
-def _download_backlog_worker():
+def _download_backlog_worker(creator_names=None):
     global BACKLOG_STATUS
-    state=_load_harvest_state(); items=[w for w in state.get('works',[]) if str(w.get('download_status') or '') in ('','未选择（精华筛选）','下载失败','无媒体地址','未尝试','刷新失败')]
+    state=_load_harvest_state(); wanted={str(x).strip() for x in (creator_names or []) if str(x).strip()}
+    items=[w for w in state.get('works',[]) if str(w.get('download_status') or '') in ('','未选择（精华筛选）','下载失败','无媒体地址','未尝试','刷新失败') and (not wanted or str(w.get('creator') or '') in wanted)]
     BACKLOG_STATUS={'status':'运行中','message':'正在刷新作品页并下载待下载清单','done':0,'total':len(items),'failed':0}
     if not items:
         BACKLOG_STATUS={'status':'完成','message':'待下载清单为空','done':0,'total':0,'failed':0}; return
@@ -669,12 +720,15 @@ def _download_backlog_worker():
             for rec in items:
                 creator=rec.get('creator') or '未知博主'; group=rec.get('creator_url') or creator
                 folder=HARVEST_DIR/(re.sub(r'[\\/:*?"<>|]','_',creator)+'__'+hashlib.sha1(str(group).encode()).hexdigest()[:8]); folder.mkdir(parents=True,exist_ok=True)
-                ok=_refresh_aweme_media(rec,ctx)
-                if ok:
-                    status,path=_download_aweme(rec,folder,ctx); rec['download_status']=status; rec['local_path']=path if status in ('已下载','已存在') else ''
-                    if status=='下载失败': rec['download_error']=path
-                else:
-                    rec['download_status']='刷新失败'; rec['download_error']='作品页未返回新的媒体地址'
+                try:
+                    ok=_refresh_aweme_media(rec,ctx)
+                    if ok:
+                        status,path=_download_aweme(rec,folder,ctx); rec['download_status']=status; rec['local_path']=path if status in ('已下载','已存在') else ''
+                        if status=='下载失败': rec['download_error']=path
+                    else:
+                        rec['download_status']='刷新失败'; rec['download_error']='作品页未返回新的媒体地址'
+                except Exception as exc:
+                    rec['download_status']='刷新失败'; rec['download_error']=str(exc)
                 BACKLOG_STATUS['done']+=1
                 if rec.get('download_status') not in ('已下载','已存在'): BACKLOG_STATUS['failed']+=1
                 state['works']=list({str(w.get('aweme_id')):w for w in state.get('works',[])}.values()); _save_harvest_state(state)
@@ -683,14 +737,14 @@ def _download_backlog_worker():
     except Exception as exc:
         BACKLOG_STATUS['status']='失败'; BACKLOG_STATUS['message']=str(exc)
 
-def start_backlog_download():
+def start_backlog_download(creator_names=None):
     global BACKLOG_THREAD
     with BACKLOG_LOCK:
         if HARVEST_THREAD is not None and HARVEST_THREAD.is_alive():
             return {'ok':False,'message':'当前采集任务仍在运行，请先暂停或完成采集后再下载待下载清单。'}
         if BACKLOG_THREAD is not None and BACKLOG_THREAD.is_alive(): return {'ok':True,'message':'待下载任务已经在运行。'}
-        BACKLOG_THREAD=threading.Thread(target=_download_backlog_worker,daemon=True); BACKLOG_THREAD.start()
-    return {'ok':True,'message':'已开始刷新 CDN 地址并下载待下载清单。'}
+        BACKLOG_THREAD=threading.Thread(target=_download_backlog_worker,args=(creator_names,),daemon=True); BACKLOG_THREAD.start()
+    return {'ok':True,'message':('已开始刷新指定博主的 CDN 地址并下载。' if creator_names else '已开始刷新 CDN 地址并下载待下载清单。')}
 
 def backlog_status():
     state=_load_harvest_state()
@@ -781,6 +835,15 @@ def _harvest_worker(resume=False):
         state['phase']='逐个采集主页'; _save_harvest_state(state)
         if not creators: raise RuntimeError('关注列表读取结果为空；请确认登录状态及关注页面正常显示')
         known={str(w.get('aweme_id')):w for w in state.get('works',[]) if w.get('aweme_id')}
+        retry_only=set(str(x) for x in state.get('retry_only_urls',[]) if x)
+        retry_old={}
+        retry_batch=state.get('retry_batch') or {}
+        if retry_batch.get('snapshot'):
+            try:
+                for old in json.loads(Path(retry_batch['snapshot']).read_text(encoding='utf-8')):
+                    retry_old.setdefault(str(old.get('creator_url') or ''),[]).append(old)
+            except Exception as exc:
+                state.setdefault('errors',[]).append({'creator':'重试快照','error':str(exc)})
         def collect(ctx):
             # One Playwright page collects creators sequentially. Downloads use
             # a bounded thread pool and plain urllib, so no browser context is
@@ -819,12 +882,26 @@ def _harvest_worker(resume=False):
                 for idx,creator in enumerate(creators,1):
                     _harvest_checkpoint(state)
                     drain(False)
-                    if idx<=int(state.get('creator_done',0)): continue
+                    creator_url=str(creator.get('url') or '')
+                    if retry_only and creator_url not in retry_only:
+                        continue
+                    if idx<=int(state.get('creator_done',0)):
+                        if not retry_only:
+                            continue
+                        previous=state.get('creator_records',[{}])[idx-1] if idx-1 < len(state.get('creator_records',[])) else {}
+                        if str(previous.get('status') or '') in ('完成','完成（有告警）'):
+                            continue
                     _set_creator_record(state,idx-1,name=creator.get('name',''),url=creator.get('url',''),status='采集中',works=0,downloaded=0,errors=0)
                     state['phase']=f"采集 {creator.get('name','')} ({idx}/{len(creators)})"; _save_harvest_state(state)
                     try:
                         works,warning=_collect_creator_all(ctx,creator)
-                        folder=HARVEST_DIR/(re.sub(r'[\/:*?"<>|]','_',creator.get('name') or '未知博主')+'__'+hashlib.sha1(creator.get('url','').encode()).hexdigest()[:8]); folder.mkdir(parents=True,exist_ok=True)
+                        folder=_creator_archive_folder(creator); folder.mkdir(parents=True,exist_ok=True)
+                        current_ids={str(w.get('aweme_id') or '') for w in works}
+                        for old in retry_old.get(str(creator.get('url') or ''),[]):
+                            aid=str(old.get('aweme_id') or '')
+                            if aid and aid not in current_ids:
+                                pending_old=dict(old); pending_old.update({'download_status':'待复核','local_path':'','media_urls':[],'selection_reason':'本轮未发现，待复核','availability_status':'待复核'})
+                                works.append(pending_old)
                         for rec in works:
                             prev=known.get(rec.get('aweme_id'),{}); prev.update(rec); known[rec.get('aweme_id')]=prev
                         state['works']=list(known.values()); _save_harvest_state(state)
@@ -869,10 +946,12 @@ def _harvest_worker(resume=False):
                 groups.setdefault(rec.get('creator_url') or rec.get('creator') or '未知博主',[]).append(rec)
             state['phase']='复核精华清单并补下载'; _save_harvest_state(state)
             for group, items in groups.items():
+                _harvest_checkpoint(state)
                 ids=_essence_aweme_ids(items) if profile=='essence' else _standard_aweme_ids(items)
                 creator=items[0].get('creator') or '未知博主'
                 folder=HARVEST_DIR/(re.sub(r'[\\/:*?"<>|]','_',creator)+'__'+hashlib.sha1(str(group).encode()).hexdigest()[:8]); folder.mkdir(parents=True,exist_ok=True)
                 for rec in items:
+                    _harvest_checkpoint(state)
                     if str(rec.get('aweme_id')) not in ids: continue
                     if rec.get('download_status') in ('已下载','已存在'): continue
                     status,path=_download_aweme(rec,folder,ctx)
@@ -884,6 +963,11 @@ def _harvest_worker(resume=False):
         # behavior and leaves the web task looking unresponsive.
         interactive_browser_call(collect,timeout=86400)
         interactive_browser_call(reconcile_essence,timeout=86400)
+        if retry_only:
+            state.pop('retry_only_urls',None)
+            if isinstance(state.get('retry_batch'),dict):
+                state['retry_batch']['finished_at']=time.strftime('%Y-%m-%d %H:%M:%S')
+                state['retry_batch']['status']='完成'
         state['phase']='生成 Excel'; _save_harvest_state(state)
         state['workbook']=export_harvest_workbook(state)
         state['status']='完成'; state['phase']='完成'; _save_harvest_state(state)
@@ -1007,7 +1091,7 @@ def control_harvest(action):
     if action=='stop' and state.get('status')=='运行中':
         HARVEST_STOP.set(); HARVEST_PAUSE.clear(); return {'ok':True,'message':'已请求停止，当前请求完成后保存断点。'}
     if action=='retry':
-        state['errors']=[]; return control_harvest('resume')
+        return prepare_retry_non_completed()
     return {'ok':True,'message':f'当前状态为 {state.get("status","空闲")}，没有执行该操作。'}
 
 def save_creator_items(items):
@@ -1205,7 +1289,7 @@ class Handler(BaseHTTPRequestHandler):
             try: reply(self,repair_duplicate_archives())
             except Exception as e: reply(self,{'error':str(e)},500)
             return
-        if u.path=='/api/harvest-backlog-download': reply(self,start_backlog_download()); return
+        if u.path=='/api/harvest-backlog-download': reply(self,start_backlog_download(d.get('creators') or None)); return
         if u.path=='/api/creators/bulk':
             _,added=save_creator_items(d.get('items')); reply(self,{'ok':True,'added':added,'message':f'已保存 {added} 个新博主。'}); return
         if u.path=='/api/creators-export':

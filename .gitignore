@@ -29,3 +29,6 @@ __pycache__/
 .idea/
 Thumbs.db
 Desktop.ini
+
+# Local browser session profile
+整理工具/edge_login_profile/
