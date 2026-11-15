@@ -2,12 +2,12 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { defineStore } from 'pinia'
 
-export type FeedItem={file_id:string;work_id:string;creator_id:string;current_path:string;title:string;creator:string;duration:number|string;reason:string}
+export type FeedItem={file_id:string;work_id:string;creator_id:string;current_path:string;title:string;creator:string;duration:number|string;reason:string;library_role?:string;video_label?:string}
 const api=async<T>(path:string,init?:RequestInit):Promise<T>=>{const r=await fetch(path,init);if(!r.ok)throw new Error(await r.text());return r.json()}
 const useFeedStore=defineStore('feed',()=>{
-  const mode=ref('recommend'),items=ref<FeedItem[]>([]),index=ref(0),page=ref(0),loading=ref(false),real=ref(false),hasMore=ref(true),liked=ref<Set<string>>(new Set()),disliked=ref<Set<string>>(new Set()),favorited=ref<Set<string>>(new Set()),notice=ref('')
+  const mode=ref('recommend'),source=ref('primary'),creatorId=ref(''),creatorName=ref(''),items=ref<FeedItem[]>([]),index=ref(0),page=ref(0),loading=ref(false),real=ref(false),hasMore=ref(true),liked=ref<Set<string>>(new Set()),disliked=ref<Set<string>>(new Set()),favorited=ref<Set<string>>(new Set()),notice=ref('')
   const current=computed(()=>items.value[index.value])
-  async function load(reset=true){if(loading.value)return;loading.value=true;try{const p=reset?0:page.value+1;const batch=await api<FeedItem[]>(`/api/feed?mode=${mode.value}&limit=12&page=${p}`);if(reset){items.value=batch;index.value=0;page.value=0}else{items.value.push(...batch);page.value=p}hasMore.value=batch.length>0&&batch.length===12}finally{loading.value=false}}
+  async function load(reset=true){if(loading.value)return;loading.value=true;try{const p=reset?0:page.value+1;const q=new URLSearchParams({mode:mode.value,source:source.value,limit:'12',page:String(p)});if(creatorId.value)q.set('creator_id',creatorId.value);const batch=await api<FeedItem[]>(`/api/feed?${q}`);if(reset){items.value=batch;index.value=0;page.value=0}else{items.value.push(...batch);page.value=p}hasMore.value=batch.length>0&&batch.length===12}finally{loading.value=false}}
   async function loadMore(){if(hasMore.value&&!loading.value)await load(false)}
   async function loadFavorites(){const rows=await api<Array<{file_id:string}>>('/api/favorites').catch(()=>[]);favorited.value=new Set(rows.map(x=>x.file_id))}
   async function event(type:string,extra:Record<string,unknown>={}){if(!real.value||!current.value)return;await api('/api/event',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({file_id:current.value.file_id,work_id:current.value.work_id,event_type:type,mode:'real',extra})}).catch(()=>{})}
@@ -15,11 +15,12 @@ const useFeedStore=defineStore('feed',()=>{
   async function like(){const x=current.value;if(!x)return;liked.value.add(x.file_id);disliked.value.delete(x.file_id);flash('已喜欢，将增加相似内容');await event('like',{creator_id:x.creator_id})}
   async function dislike(){const x=current.value;if(!x)return;disliked.value.add(x.file_id);liked.value.delete(x.file_id);flash('已减少此类推荐');await event('dislike',{creator_id:x.creator_id});window.setTimeout(()=>next(1),180)}
   async function toggleFavorite(){const x=current.value;if(!x)return;const add=!favorited.value.has(x.file_id);if(add)favorited.value.add(x.file_id);else favorited.value.delete(x.file_id);flash(add?'已加入收藏':'已取消收藏');await event(add?'favorite':'unfavorite',{file_id:x.file_id,creator_id:x.creator_id})}
+  function setCreator(id:string,name:string){creatorId.value=id;creatorName.value=name;mode.value='creator';void load(true)}
   async function next(delta:number){const n=Math.max(0,Math.min(items.value.length-1,index.value+delta));if(n!==index.value){void event(delta>0?'skip':'rewind');index.value=n;if(index.value>=items.value.length-3)void loadMore()}}
-  return{mode,items,index,current,loading,real,hasMore,liked,disliked,favorited,notice,load,loadMore,loadFavorites,event,next,like,dislike,toggleFavorite}
+  return{mode,source,creatorId,creatorName,items,index,current,loading,real,hasMore,liked,disliked,favorited,notice,load,loadMore,loadFavorites,event,next,like,dislike,toggleFavorite,setCreator}
 })
 const store=useFeedStore()
-const shell=ref<HTMLElement|null>(null),viewport=ref<HTMLElement|null>(null),paused=ref(false),immersive=ref(false),startY=ref(0),moved=ref(false),clickTimer=ref<number|null>(null)
+const shell=ref<HTMLElement|null>(null),viewport=ref<HTMLElement|null>(null),paused=ref(false),immersive=ref(false),startY=ref(0),moved=ref(false),clickTimer=ref<number|null>(null),detail=ref('')
 const videoRefs=ref<Record<number,HTMLVideoElement>>({}),preloadCache=new Map<number,HTMLVideoElement>(),slotIndices=computed(()=>[store.index-1,store.index,store.index+1].filter(i=>i>=0&&i<store.items.length))
 function media(x:FeedItem){return`/media?path=${encodeURIComponent(x.current_path)}`}
 function setVideoRef(i:number,el:Element|null){if(el)videoRefs.value[i]=el as HTMLVideoElement;else delete videoRefs.value[i]}
@@ -28,6 +29,8 @@ function prepare(i:number){const v=videoRefs.value[i],x=store.items[i];if(!v||!x
 function prepareSlots(){nextTick(()=>{for(const i of slotIndices.value)prepare(i);warm(store.index+1);warm(store.index-1);for(const [i,v] of preloadCache){if(Math.abs(i-store.index)>2){v.src='';preloadCache.delete(i)}}})}
 function singleClick(){if(clickTimer.value)clearTimeout(clickTimer.value);clickTimer.value=window.setTimeout(()=>{const v=videoRefs.value[store.index];if(v)v.paused?v.play().catch(()=>{}):v.pause()},220)}
 function doubleClick(){if(clickTimer.value)clearTimeout(clickTimer.value);void store.like()}
+function showSource(){const x=store.current;if(x)detail.value=`来源：${x.library_role||'主库'}\n标签：${x.video_label||'已确认'}\n路径：${x.current_path}`}
+function showInfo(){const x=store.current;if(x)detail.value=`作品：${x.title||'未命名'}\n博主：${x.creator||'博主待确认'}\n时长：${x.duration||'未知'} 秒\n作品编号：${x.work_id||'暂无'}`}
 function touchStart(e:TouchEvent){startY.value=e.touches[0].clientY;moved.value=false}
 function touchMove(e:TouchEvent){if(Math.abs(e.touches[0].clientY-startY.value)>12)moved.value=true}
 function touchEnd(e:TouchEvent){const d=startY.value-e.changedTouches[0].clientY;if(moved.value&&Math.abs(d)>Math.max(48,window.innerHeight*.12))void store.next(d>0?1:-1)}
@@ -39,13 +42,14 @@ onBeforeUnmount(()=>{document.removeEventListener('fullscreenchange',fullscreenC
 </script>
 <template>
 <main ref="shell" class="player-shell" :class="{immersive}">
-<header class="topbar"><button class="icon" @click="toggleFullscreen">{{immersive?'×':'⛶'}}</button><div class="tabs"><button :class="{active:store.mode==='recommend'}" @click="store.mode='recommend';store.load()">推荐</button><button :class="{active:store.mode==='creator'}" @click="store.mode='creator';store.load()">博主</button><button :class="{active:store.mode==='random'}" @click="store.mode='random';store.load()">探索</button></div><button class="real" @click="store.real=!store.real">{{store.real?'真实':'测试'}}</button></header>
+<header class="topbar"><button class="icon" @click="toggleFullscreen">{{immersive?'×':'⛶'}}</button><div class="tabs"><button :class="{active:store.mode==='recommend'&&!store.creatorId}" @click="store.creatorId='';store.mode='recommend';store.load()">推荐</button><button :class="{active:store.mode==='creator'}" @click="store.creatorId='';store.mode='creator';store.load()">博主</button><button :class="{active:store.mode==='random'}" @click="store.creatorId='';store.mode='random';store.load()">探索</button></div><select class="source-select" v-model="store.source" @change="store.load()"><option value="primary">主库</option><option value="supplement">补充</option><option value="rare">疑似绝版</option><option value="favorites">收藏</option><option value="all">全部</option></select><button class="real" @click="store.real=!store.real">{{store.real?'真实':'测试'}}</button></header>
 <section ref="viewport" class="viewport" @click="singleClick" @dblclick="doubleClick" @touchstart="touchStart" @touchmove="touchMove" @touchend="touchEnd" @wheel.prevent="store.next($event.deltaY>0?1:-1)">
 <div class="video-stage"><div v-for="i in slotIndices" :key="i" class="video-card" :class="{active:i===store.index}" :style="{transform:`translate3d(0,${(i-store.index)*100}%,0)`}"><video :ref="el=>setVideoRef(i,el)" class="video" playsinline></video></div></div>
 <div v-if="store.loading&&!store.current" class="loading">加载中…</div><div v-if="!store.current&&!store.loading" class="loading">暂无视频</div>
-<div v-if="store.current" class="meta"><b>@{{store.current.creator}}</b><p>{{store.current.title||'未命名视频'}}</p><small>{{store.current.reason}}</small></div>
-<aside v-if="store.current" class="actions"><button class="like-button" :class="{selected:store.liked.has(store.current.file_id)}" @click.stop="void store.like()">♥<small>{{store.liked.has(store.current.file_id)?'已喜欢':'喜欢'}}</small></button><button class="dislike-button" :class="{selected:store.disliked.has(store.current.file_id)}" @click.stop="void store.dislike()">⌄<small>不喜欢</small></button><button class="favorite-button" :class="{selected:store.favorited.has(store.current.file_id)}" @click.stop="void store.toggleFavorite()">☆<small>{{store.favorited.has(store.current.file_id)?'已收藏':'收藏'}}</small></button><button @click.stop="store.next(1)">›<small>下一个</small></button></aside>
+<div v-if="store.current" class="meta"><b class="creator-link" @click.stop="store.setCreator(store.current.creator_id,store.current.creator)">@{{store.current.creator}}</b><p>{{store.current.title||'未命名视频'}}</p><small>{{store.current.reason}}</small></div>
+<aside v-if="store.current" class="actions"><button class="like-button" :class="{selected:store.liked.has(store.current.file_id)}" @click.stop="void store.like()">♥<small>{{store.liked.has(store.current.file_id)?'已喜欢':'喜欢'}}</small></button><button class="dislike-button" :class="{selected:store.disliked.has(store.current.file_id)}" @click.stop="void store.dislike()">⌄<small>不喜欢</small></button><button class="favorite-button" :class="{selected:store.favorited.has(store.current.file_id)}" @click.stop="void store.toggleFavorite()">☆<small>{{store.favorited.has(store.current.file_id)?'已收藏':'收藏'}}</small></button><button @click.stop="showSource">⌂<small>来源</small></button><button @click.stop="showInfo">ⓘ<small>作品信息</small></button></aside>
 <div v-if="store.notice" class="feedback-toast">{{store.notice}}</div>
+<div v-if="detail" class="detail-panel" @click.stop><button class="detail-close" @click="detail=''">×</button><pre>{{detail}}</pre></div>
 </section><nav class="bottom"><span class="selected">⌂ 推荐</span><span>♡ 喜欢</span><span @click="store.notice='收藏记录已保存到本地反馈'">☆ 收藏</span><span>◉ 我的</span></nav>
 </main>
 </template>

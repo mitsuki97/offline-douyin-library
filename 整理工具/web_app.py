@@ -166,14 +166,16 @@ class Handler(BaseHTTPRequestHandler):
                       and not exists(select 1 from feedback b where b.event_type='unfavorite' and json_extract(b.extra_json,'$.file_id')=f.id and b.rowid>a.rowid))
                     order by f.id desc limit 500""")); return
             if u.path=='/api/feed':
-                mode=parse_qs(u.query).get('mode',['recommend'])[0]
+                query=parse_qs(u.query); mode=query.get('mode',['recommend'])[0]; source=query.get('source',['primary'])[0]; creator_id=query.get('creator_id',[''])[0]
                 page=max(0,int(parse_qs(u.query).get('page',['0'])[0] or 0))
                 limit=min(30,max(1,int(parse_qs(u.query).get('limit',['12'])[0] or 12)))
                 order={'random':'random()','creator':'f.creator_id,random()','recommend':'''case when coalesce(f.library_role,'补充来源')='主库' then 0 else 1 end,
                     ((select count(*) from feedback lb
                     where lb.event_type='like' and json_extract(lb.extra_json,'$.creator_id')=coalesce(f.creator_id,'')) * 1000
                     + abs(random()) % 100000) desc'''} .get(mode,'random()')
-                sql=f'''select f.id file_id,f.work_id,f.creator_id,f.current_path,f.status,w.title,coalesce(cr.name,'博主待确认') creator,m.duration,
+                source_sql={'primary':" and coalesce(f.library_role,'主库')='主库' and coalesce(f.video_label,'')!='疑似绝版，待核对'",'supplement':" and coalesce(f.library_role,'')='补充来源' and coalesce(f.video_label,'')!='疑似绝版，待核对'",'rare':" and f.video_label='疑似绝版，待核对'",'all':'','favorites':" and exists(select 1 from feedback fav where fav.event_type='favorite' and json_extract(fav.extra_json,'$.file_id')=f.id and not exists(select 1 from feedback unf where unf.event_type='unfavorite' and json_extract(unf.extra_json,'$.file_id')=f.id and unf.rowid>fav.rowid))"}.get(source,'')
+                creator_sql=' and f.creator_id=?' if creator_id else ''
+                sql=f'''select f.id file_id,f.work_id,f.creator_id,f.current_path,f.status,f.library_role,f.video_label,w.title,coalesce(cr.name,'博主待确认') creator,m.duration,
                     case when ?='creator' then '博主轮播' when ?='random' then '随机探索' else '本地推荐' end reason
                     from files f left join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
                     where f.kind='video' and f.status!='已永久删除' and f.duplicate_of is null
@@ -182,8 +184,11 @@ class Handler(BaseHTTPRequestHandler):
                     and not exists(select 1 from feedback b where b.event_type='block_creator' and json_extract(b.extra_json,'$.creator_id')=coalesce(f.creator_id,''))
                     and not exists(select 1 from feedback b where b.event_type in ('dislike','dislike_video') and json_extract(b.extra_json,'$.file_id')=f.id)
                     and not exists(select 1 from feedback b where b.event_type='dislike_creator' and json_extract(b.extra_json,'$.creator_id')=coalesce(f.creator_id,''))
+                    {source_sql}{creator_sql}
                     order by {order} limit ? offset ?'''
-                self.send_json(rows(c,sql,(mode,mode,limit,page*limit))); return
+                params=[mode,mode]
+                if creator_id: params.append(creator_id)
+                params.extend([limit,page*limit]); self.send_json(rows(c,sql,params)); return
             if u.path=='/api/similar': self.send_json(rows(c,"""select s.a,s.b,s.reason,s.score,s.decision,s.note,
                 fa.current_path path_a,coalesce(wa.title,'未命名') title_a,coalesce(ca.name,'博主待确认') creator_a,fa.status status_a,
                 fb.current_path path_b,coalesce(wb.title,'未命名') title_b,coalesce(cb.name,'博主待确认') creator_b,fb.status status_b
