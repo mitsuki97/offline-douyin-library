@@ -26,11 +26,25 @@ BACKLOG_THREAD=None; BACKLOG_LOCK=threading.RLock(); BACKLOG_STATUS={'status':'�
 BATCHES={}; BATCH_LOCK=threading.RLock()
 DOWNLOADER_CONFIG=ROOT/'web_config.json'
 
+def _write_json_atomic(path,obj):
+    """Replace a JSON file only after the complete payload is on disk."""
+    path=Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    tmp=path.with_name(path.name+f'.{os.getpid()}.{threading.get_ident()}.tmp')
+    tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
+    last_exc=None
+    for attempt in range(8):
+        try:
+            tmp.replace(path); last_exc=None; break
+        except OSError as exc:
+            last_exc=exc; time.sleep(0.15*(attempt+1))
+    if last_exc is not None:
+        raise last_exc
+
 def _load_downloader_config():
     try: return json.loads(DOWNLOADER_CONFIG.read_text(encoding='utf-8'))
     except Exception:
         cfg={'management_password':os.environ.get('DOUYIN_DOWNLOADER_PASSWORD','123456'),'created_at':time.strftime('%Y-%m-%d %H:%M:%S')}
-        DOWNLOADER_CONFIG.write_text(json.dumps(cfg,ensure_ascii=False,indent=2),encoding='utf-8'); return cfg
+        _write_json_atomic(DOWNLOADER_CONFIG,cfg); return cfg
 
 DOWNLOADER_CFG=_load_downloader_config()
 
@@ -43,13 +57,13 @@ def read_creators():
     if not CREATORS.exists(): return []
     try: return json.loads(CREATORS.read_text(encoding='utf-8'))
     except Exception: return []
-def write_creators(items): CREATORS.write_text(json.dumps(items,ensure_ascii=False,indent=2),encoding='utf-8')
+def write_creators(items): _write_json_atomic(CREATORS,items)
 
 def clear_creators():
     items=read_creators()
     stamp=time.strftime('%Y%m%d_%H%M%S')
     backup=CREATORS.with_name(f'creators_backup_{stamp}.json')
-    if CREATORS.exists(): backup.write_text(json.dumps(items,ensure_ascii=False,indent=2),encoding='utf-8')
+    if CREATORS.exists(): _write_json_atomic(backup,items)
     write_creators([])
     return len(items),str(backup) if items else ''
 def reply(h,obj,status=200):
@@ -404,13 +418,7 @@ def _save_json_mirrors(state):
     }
     for name,obj in mirrors.items():
         target=HARVEST_DATA/name
-        tmp=target.with_name(target.stem+f'.{os.getpid()}.tmp')
-        tmp.write_text(json.dumps(obj,ensure_ascii=False,indent=2),encoding='utf-8')
-        for attempt in range(8):
-            try: tmp.replace(target); break
-            except OSError:
-                if attempt==7: raise
-                time.sleep(0.15*(attempt+1))
+        _write_json_atomic(target,obj)
 
 def _save_harvest_state(state):
     with HARVEST_WRITE_LOCK:
@@ -465,8 +473,8 @@ def _write_download_backlog(state):
             'last_cdn_seen_at':w.get('last_cdn_seen_at',''),
             'last_error':w.get('download_error','')
         })
-    out=HARVEST_DIR/'待下载清单.json'; tmp=out.with_suffix('.tmp')
-    tmp.write_text(json.dumps({'generated_at':time.strftime('%Y-%m-%d %H:%M:%S'),'items':rows},ensure_ascii=False,indent=2),encoding='utf-8'); tmp.replace(out)
+    out=HARVEST_DIR/'待下载清单.json'
+    _write_json_atomic(out,{'generated_at':time.strftime('%Y-%m-%d %H:%M:%S'),'items':rows})
     csv_path=HARVEST_DIR/'待下载清单.csv'
     with csv_path.open('w',encoding='utf-8-sig',newline='') as f:
         fields=['creator','creator_url','aweme_id','title','publish_time','play_count','digg_count','collect_count','url','download_status','selection_reason','last_cdn_seen_at','last_error']
@@ -548,9 +556,9 @@ def prepare_retry_non_completed():
     target_urls={str(r.get('url') or '') for r in records if str(r.get('status') or '')!='完成' and str(r.get('url') or '')}
     if not target_urls: return {'ok':False,'message':'没有需要重试的博主。','count':0}
     stamp=time.strftime('%Y%m%d_%H%M%S'); quarantine=LIB/'虚拟回收站'/f'重试_{stamp}'; quarantine.mkdir(parents=True,exist_ok=True)
-    (quarantine/'state_before.json').write_text(json.dumps(state,ensure_ascii=False,indent=2),encoding='utf-8')
+    _write_json_atomic(quarantine/'state_before.json',state)
     old_works=[w for w in state.get('works',[]) if str(w.get('creator_url') or '') in target_urls]
-    (quarantine/'works_before.json').write_text(json.dumps(old_works,ensure_ascii=False,indent=2),encoding='utf-8')
+    _write_json_atomic(quarantine/'works_before.json',old_works)
     moved=[]
     for url in target_urls:
         creator=by_url.get(url,{'name':'未知博主','url':url}); folder=_creator_archive_folder(creator)
@@ -905,7 +913,7 @@ def _harvest_worker(resume=False):
                         for rec in works:
                             prev=known.get(rec.get('aweme_id'),{}); prev.update(rec); known[rec.get('aweme_id')]=prev
                         state['works']=list(known.values()); _save_harvest_state(state)
-                        (folder/'主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8')
+                        _write_json_atomic(folder/'主页作品.json',works)
                         selected_ids=(_essence_aweme_ids(works) if profile=='essence' else _standard_aweme_ids(works) if profile=='standard' else {str(r.get('aweme_id')) for r in works})
                         submitted=0
                         for rec in works:
@@ -926,7 +934,7 @@ def _harvest_worker(resume=False):
                         d=stats.setdefault(idx,{'done':0,'failed':0,'total':0,'expected':0})
                         _set_creator_record(state,idx-1,status='采集完成（下载中）' if submitted else ('完成（有告警）' if d['failed'] else '完成'),phase='后台下载视频' if submitted else '已完成',progress=100,works=len(works),downloaded=d['done'],errors=d['failed'],download_total=d.get('expected',0))
                         if warning: state['errors'].append({'creator':creator.get('name'),'error':warning})
-                        (folder/'主页作品.json').write_text(json.dumps(works,ensure_ascii=False,indent=2),encoding='utf-8'); _save_harvest_state(state)
+                        _write_json_atomic(folder/'主页作品.json',works); _save_harvest_state(state)
                     except HarvestStopped:
                         _set_creator_record(state,idx-1,status='已停止',works=len(works) if 'works' in locals() else 0); _save_harvest_state(state); raise
                     except Exception as exc:
@@ -1055,9 +1063,9 @@ def repair_duplicate_archives():
                     report.append({'folder':manifest.parent.name,'aweme_id':aid,'source':str(candidate),'quarantine':str(dest),'creator':row.get('creator',''),'actual_author_sec_uid':author})
                 except Exception as exc:
                     report.append({'folder':manifest.parent.name,'aweme_id':aid,'error':str(exc)})
-        manifest.write_text(json.dumps(keep,ensure_ascii=False,indent=2),encoding='utf-8')
+        _write_json_atomic(manifest,keep)
     quarantine.mkdir(parents=True,exist_ok=True)
-    (quarantine/'修复报告.json').write_text(json.dumps({'created_at':time.strftime('%Y-%m-%d %H:%M:%S'),'folders_changed':changed,'files_moved':moved,'items':report},ensure_ascii=False,indent=2),encoding='utf-8')
+    _write_json_atomic(quarantine/'修复报告.json',{'created_at':time.strftime('%Y-%m-%d %H:%M:%S'),'folders_changed':changed,'files_moved':moved,'items':report})
     return {'ok':True,'message':f'归属修复完成：检查并更新 {changed} 个文件夹，移入虚拟回收站 {moved} 个文件。','quarantine':str(quarantine),'folders_changed':changed,'files_moved':moved}
 
 def start_harvest(options=None):
@@ -1154,7 +1162,7 @@ def make_task(item, data):
     records=discover_video_urls(item['url'],item) if '/user/' in item['url'] else [{'url':item['url'],'aweme_id':item['url'].rstrip('/').rsplit('/',1)[-1],'media_urls':[]}]
     urls=[x.get('url') for x in records if x.get('url')]
     task={'task_id':tid,'creator_name':item['name'],'homepage_url':item['url'],'video_urls':urls,'video_items':records,'start_date':data.get('start_date',''),'download_dir':str(LIB/'待导入'/item['name']),'cookie_mode':data.get('cookie_mode',''),'cookie_file':data.get('cookie_file',''),'status':'待下载'}
-    path.write_text(json.dumps(task,ensure_ascii=False,indent=2),encoding='utf-8'); return tid,path
+    _write_json_atomic(path,task); return tid,path
 
 def _bulk_download_worker(batch_id, items, data):
     with BATCH_LOCK:
@@ -1333,3 +1341,4 @@ class Handler(BaseHTTPRequestHandler):
 if __name__=='__main__':
     print(f'独立下载器: http://127.0.0.1:{PORT}')
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+
