@@ -1,6 +1,6 @@
 from __future__ import annotations
 import base64, hashlib, json, os, secrets, shutil, sqlite3, threading, time, subprocess, sys
-import re, unicodedata
+import re, unicodedata, socket
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -12,6 +12,7 @@ DB = LIB / '索引' / 'library.sqlite3'
 CONFIG = LIB / '索引' / 'web_config.json'
 HOST = os.environ.get('DOUYIN_HOST', '0.0.0.0')
 PORT = int(os.environ.get('DOUYIN_PORT', '8765'))
+DOWNLOADER_PORT = int(os.environ.get('DOUYIN_DOWNLOADER_PORT', '8766'))
 
 def load_config():
     CONFIG.parent.mkdir(parents=True, exist_ok=True)
@@ -26,6 +27,36 @@ SESSIONS = {}
 JOBS = {}
 LOCK = threading.Lock()
 
+def process_alive(pid):
+    try:
+        pid = int(pid or 0)
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+def primary_job_file(job_id):
+    if not re.fullmatch(r'primaryindex_[A-Za-z0-9]+', str(job_id or '')):
+        return None
+    p = LIB / '索引' / '主库优先整理' / 'jobs' / f'{job_id}.json'
+    return p if p.is_file() else None
+
+def primary_runtime_state(job):
+    """恢复服务重启前的扫描状态；只根据任务 JSON 和扫描器 PID 判断。"""
+    if not isinstance(job, dict):
+        return job
+    if job.get('status') == '运行中':
+        alive = process_alive(job.get('worker_pid'))
+        job['worker_alive'] = alive
+        if alive:
+            job['needs_resume'] = False
+        else:
+            job['status'] = '已中断'
+            job['needs_resume'] = True
+    return job
+
 def db():
     c = sqlite3.connect(DB)
     c.row_factory = sqlite3.Row
@@ -34,6 +65,15 @@ def db():
         platform_id text, start_date text, mode text default 'since_date',
         status text default 'active', last_checked_at text, last_success_at text,
         created_at text, note text)''')
+    c.execute('''create table if not exists player_follows(
+        creator_id text primary key references creators(id), followed_at text not null)''')
+    c.execute('create index if not exists metrics_work_metric_value on metrics(work_id,metric,value)')
+    # Feed queries filter the same columns repeatedly. These indexes keep the
+    # player responsive as the library grows beyond the primary archive.
+    c.execute('create index if not exists files_feed_scope on files(kind,status,duplicate_of,library_role,creator_id)')
+    c.execute('create index if not exists media_file_status on media(file_id,status)')
+    c.execute("create index if not exists feedback_event_file on feedback(event_type,json_extract(extra_json,'$.file_id'))")
+    c.execute("create index if not exists feedback_event_creator on feedback(event_type,json_extract(extra_json,'$.creator_id'))")
     c.commit()
     return c
 
@@ -48,23 +88,41 @@ def safe_path(p):
     p = Path(p).resolve()
     return p if p.is_relative_to(LIB.resolve()) else None
 
+def lan_urls():
+    ips=set()
+    try:
+        ips.update(socket.gethostbyname_ex(socket.gethostname())[2])
+    except Exception:
+        pass
+    try:
+        s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM); s.connect(('192.0.2.1',80)); ips.add(s.getsockname()[0]); s.close()
+    except Exception:
+        pass
+    return [f'http://{ip}:{PORT}/' for ip in sorted(ips) if ip and not ip.startswith(('127.','169.254.'))]
+
 INDEX = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>本地抖音工作台</title>
-<style>body{margin:0;font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif;background:#f5f6fa;color:#202535}header{background:#181b27;color:white;padding:14px 22px;display:flex;justify-content:space-between;align-items:center}main{max-width:1400px;margin:auto;padding:18px}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.tabs button,.tabs a,button{border:0;border-radius:8px;padding:9px 13px;cursor:pointer;background:#e6eaf3}.tabs button.active,.tabs a.primary,button.primary{background:#315bdc;color:#fff;text-decoration:none}.panel{background:#fff;border:1px solid #e0e4ed;border-radius:12px;padding:16px;margin-bottom:16px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.stat{background:#f7f8fc;padding:12px;border-radius:9px}.stat b{display:block;font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.card{border:1px solid #e0e4ed;border-radius:10px;padding:12px;background:#fff}.card h3{margin:4px 0;font-size:16px}.muted{color:#6d7484}.danger{color:#b3261e}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}input,select{padding:9px;border:1px solid #bcc5d6;border-radius:7px;font:inherit}.hidden{display:none}video{width:100%;max-height:260px;background:#111;border-radius:8px}.creatorbar{height:5px;background:#3c65d9;border-radius:4px;margin:-12px -12px 9px}.row{display:flex;justify-content:space-between;gap:8px;align-items:center}small{overflow-wrap:anywhere;color:#687187}.badge{font-size:12px;padding:3px 7px;border-radius:999px;background:#eef1f8}.dangerbtn{background:#b3261e;color:#fff}.playerShell{max-width:560px;margin:auto;background:#111;color:#fff;border-radius:14px;overflow:hidden;position:relative}.playerShell.immersive{position:fixed;inset:0;z-index:9999;max-width:none;width:100vw;height:100vh;border-radius:0}.playerShell.immersive .feedViewport{height:100vh;min-height:0}.playerShell:fullscreen{max-width:none;width:100vw;height:100vh;border-radius:0}.playerShell:fullscreen .feedViewport{height:100vh;min-height:0}.playerShell.immersive .playerTop{position:absolute;inset:0 0 auto;z-index:5;background:linear-gradient(rgba(0,0,0,.38),transparent);pointer-events:none}.playerShell.immersive .playerTop select,.playerShell.immersive #modeButton,.playerShell.immersive #reason,.playerShell.immersive #modeNotice{display:none}.playerShell.immersive #fullscreenButton{display:block;margin-left:auto;pointer-events:auto;background:rgba(0,0,0,.45);color:#fff;font-size:22px;border-radius:50%;width:42px;height:42px;padding:0}.playerShell.immersive .videoOverlay h2,.playerShell.immersive .videoOverlay p,.playerShell.immersive .videoOverlay .why{display:none}.playerShell.immersive .videoOverlay{padding:18px;background:none}.playerShell.immersive .videoOverlay .actions{justify-content:flex-end}.playerShell:fullscreen .playerTop{position:absolute;inset:0 0 auto;z-index:5;background:linear-gradient(rgba(0,0,0,.38),transparent);pointer-events:none}.playerShell:fullscreen .playerTop select,.playerShell:fullscreen #modeButton,.playerShell:fullscreen #reason,.playerShell:fullscreen #modeNotice{display:none}.playerShell:fullscreen #fullscreenButton{display:block;margin-left:auto;pointer-events:auto;background:rgba(0,0,0,.45);color:#fff;font-size:22px;border-radius:50%;width:42px;height:42px;padding:0}.playerShell:fullscreen .videoOverlay h2,.playerShell:fullscreen .videoOverlay p,.playerShell:fullscreen .videoOverlay .why{display:none}.playerShell:fullscreen .videoOverlay{padding:18px;background:none}.playerShell:fullscreen .videoOverlay .actions{justify-content:flex-end}.playerTop{padding:12px;background:#181b27;display:flex;justify-content:space-between;align-items:center;gap:8px}.playerTop #reason{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.feedViewport{height:min(78vh,780px);min-height:520px;position:relative;background:#000;overflow:hidden;outline:none;touch-action:pan-y;user-select:none}.feedViewport>video{width:100%;height:100%;max-height:none;object-fit:contain;transition:opacity .16s ease}.videoOverlay{position:absolute;inset:auto 0 0;padding:70px 18px 18px;background:linear-gradient(transparent,rgba(0,0,0,.86));pointer-events:none}.videoOverlay h2,.videoOverlay p{margin:4px 0;text-shadow:0 1px 3px #000}.videoOverlay .actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px;pointer-events:auto}.videoOverlay button{background:rgba(255,255,255,.9);color:#202535}.playerHelp{padding:10px;text-align:center;background:#181b27;color:#b9c1d4;font-size:12px}@keyframes heart{0%{opacity:0;transform:translate(-50%,-50%) scale(.5)}30%{opacity:1}100%{opacity:0;transform:translate(-50%,-50%) scale(1.25)}}@media(max-width:600px){body:has(.playerShell) header,body:has(.playerShell) main{padding:0}body:has(.playerShell) main{max-width:none}.playerShell{max-width:none;border-radius:0;height:calc(100vh - 52px)}.feedViewport{height:calc(100vh - 145px);min-height:420px}.playerShell .playerHelp{display:none}.playerTop{padding:9px 10px}}
+<style>body{margin:0;font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif;background:#f5f6fa;color:#202535}header{background:#181b27;color:white;padding:14px 22px;display:flex;justify-content:space-between;align-items:center}main{max-width:1400px;margin:auto;padding:18px}.tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}.tabs button,.tabs a,button{border:0;border-radius:8px;padding:9px 13px;cursor:pointer;background:#e6eaf3}.tabs button.active,.tabs a.primary,button.primary{background:#315bdc;color:#fff;text-decoration:none}.panel{background:#fff;border:1px solid #e0e4ed;border-radius:12px;padding:16px;margin-bottom:16px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}.stat{background:#f7f8fc;padding:12px;border-radius:9px}.stat b{display:block;font-size:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}.card{border:1px solid #e0e4ed;border-radius:10px;padding:12px;background:#fff}.card h3{margin:4px 0;font-size:16px}.muted{color:#6d7484}.danger{color:#b3261e}.toolbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}input,select{padding:9px;border:1px solid #bcc5d6;border-radius:7px;font:inherit}.hidden{display:none}video{width:100%;max-height:260px;background:#111;border-radius:8px}.creatorbar{height:5px;background:#3c65d9;border-radius:4px;margin:-12px -12px 9px}.row{display:flex;justify-content:space-between;gap:8px;align-items:center}small{overflow-wrap:anywhere;color:#687187}.badge{font-size:12px;padding:3px 7px;border-radius:999px;background:#eef1f8}.dangerbtn{background:#b3261e;color:#fff}.service-status{align-self:center;font-size:12px;color:#cbd3df}.service-status[data-state="online"]{color:#79d6a4}.service-status[data-state="offline"]{color:#ffb4aa}.playerShell{max-width:560px;margin:auto;background:#111;color:#fff;border-radius:14px;overflow:hidden;position:relative}.playerShell.immersive{position:fixed;inset:0;z-index:9999;max-width:none;width:100vw;height:100vh;border-radius:0}.playerShell.immersive .feedViewport{height:100vh;min-height:0}.playerShell:fullscreen{max-width:none;width:100vw;height:100vh;border-radius:0}.playerShell:fullscreen .feedViewport{height:100vh;min-height:0}.playerShell.immersive .playerTop{position:absolute;inset:0 0 auto;z-index:5;background:linear-gradient(rgba(0,0,0,.38),transparent);pointer-events:none}.playerShell.immersive .playerTop select,.playerShell.immersive #modeButton,.playerShell.immersive #reason,.playerShell.immersive #modeNotice{display:none}.playerShell.immersive #fullscreenButton{display:block;margin-left:auto;pointer-events:auto;background:rgba(0,0,0,.45);color:#fff;font-size:22px;border-radius:50%;width:42px;height:42px;padding:0}.playerShell.immersive .videoOverlay h2,.playerShell.immersive .videoOverlay p,.playerShell.immersive .videoOverlay .why{display:none}.playerShell.immersive .videoOverlay{padding:18px;background:none}.playerShell.immersive .videoOverlay .actions{justify-content:flex-end}.playerShell:fullscreen .playerTop{position:absolute;inset:0 0 auto;z-index:5;background:linear-gradient(rgba(0,0,0,.38),transparent);pointer-events:none}.playerShell:fullscreen .playerTop select,.playerShell:fullscreen #modeButton,.playerShell:fullscreen #reason,.playerShell:fullscreen #modeNotice{display:none}.playerShell:fullscreen #fullscreenButton{display:block;margin-left:auto;pointer-events:auto;background:rgba(0,0,0,.45);color:#fff;font-size:22px;border-radius:50%;width:42px;height:42px;padding:0}.playerShell:fullscreen .videoOverlay h2,.playerShell:fullscreen .videoOverlay p,.playerShell:fullscreen .videoOverlay .why{display:none}.playerShell:fullscreen .videoOverlay{padding:18px;background:none}.playerShell:fullscreen .videoOverlay .actions{justify-content:flex-end}.playerTop{padding:12px;background:#181b27;display:flex;justify-content:space-between;align-items:center;gap:8px}.playerTop #reason{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.feedViewport{height:min(78vh,780px);min-height:520px;position:relative;background:#000;overflow:hidden;outline:none;touch-action:pan-y;user-select:none}.feedViewport>video{width:100%;height:100%;max-height:none;object-fit:contain;transition:opacity .16s ease}.videoOverlay{position:absolute;inset:auto 0 0;padding:70px 18px 18px;background:linear-gradient(transparent,rgba(0,0,0,.86));pointer-events:none}.videoOverlay h2,.videoOverlay p{margin:4px 0;text-shadow:0 1px 3px #000}.videoOverlay .actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px;pointer-events:auto}.videoOverlay button{background:rgba(255,255,255,.9);color:#202535}.playerHelp{padding:10px;text-align:center;background:#181b27;color:#b9c1d4;font-size:12px}@keyframes heart{0%{opacity:0;transform:translate(-50%,-50%) scale(.5)}30%{opacity:1}100%{opacity:0;transform:translate(-50%,-50%) scale(1.25)}}@media(max-width:600px){body:has(.playerShell) header,body:has(.playerShell) main{padding:0}body:has(.playerShell) main{max-width:none}.playerShell{max-width:none;border-radius:0;height:calc(100vh - 52px)}.feedViewport{height:calc(100vh - 145px);min-height:420px}.playerShell .playerHelp{display:none}.playerTop{padding:9px 10px}}
 </style>
-<header><strong>本地抖音工作台</strong><span id="mode">管理模式（免密码）</span></header><main><div id="login" class="panel hidden"></div><div id="app"><nav class="tabs"><button data-tab="home" class="active">总览</button><button data-tab="creators">博主整理</button><button data-tab="primary">主库整理</button><button data-tab="sources">来源合并</button><button data-tab="subscriptions">自动更新</button><button data-tab="review">待确认</button><button data-tab="player" onclick="location.href='/player/'">播放器</button><a class="tabs button" id="downloaderLink" href="#" target="_blank" rel="noopener">下载器</a></nav><section id="home" class="tab"></section><section id="creators" class="tab hidden"></section><section id="primary" class="tab hidden"></section><section id="sources" class="tab hidden"></section><section id="subscriptions" class="tab hidden"></section><section id="review" class="tab hidden"></section><section id="player" class="tab hidden"></section></div></main>
+<header><strong>本地抖音工作台</strong><span id="mode">管理模式（免密码）</span><span id="lanAddress">局域网访问地址：检测中…</span></header><main><div id="login" class="panel hidden"></div><div id="app"><nav class="tabs"><button data-tab="home" class="active">总览</button><button data-tab="creators">博主整理</button><button data-tab="primary">主库整理</button><button data-tab="sources">来源合并</button><button data-tab="subscriptions">自动更新</button><button data-tab="review">待确认</button><a class="primary" href="/player/">播放器</a><a class="tabs button" id="downloaderLink" href="#" target="_blank" rel="noopener">下载器</a><span id="downloaderStatus" class="service-status" data-state="checking">下载器：检测中</span></nav><section id="home" class="tab"></section><section id="creators" class="tab hidden"></section><section id="primary" class="tab hidden"></section><section id="sources" class="tab hidden"></section><section id="subscriptions" class="tab hidden"></section><section id="review" class="tab hidden"></section></div></main>
 <script>
 let token='',admin=true,cache={};
 const $=x=>document.querySelector(x); const dl=document.querySelector('#downloaderLink'); if(dl) dl.href=location.protocol+'//'+location.hostname+':8766/'; const esc=x=>String(x??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 async function api(path,opt={}){opt.headers={...(opt.headers||{}),'Content-Type':'application/json',...(token?{'X-Admin-Token':token}:{})};let r=await fetch(path,opt);if(!r.ok)throw Error(await r.text());return r.json()}
+async function refreshDownloaderStatus(){const el=$('#downloaderStatus');if(!el)return;try{const s=await api('/api/downloader-status');el.dataset.state=s.online?'online':'offline';el.textContent=s.online?'下载器：在线':'下载器：未启动';el.title=s.online?'本机下载器服务可连接':'启动统一工作台可启动下载器'}catch(e){el.dataset.state='offline';el.textContent='下载器：状态未知'}}
+refreshDownloaderStatus();setInterval(refreshDownloaderStatus,15000);
 function browse(){admin=false;$('#login').classList.add('hidden');$('#app').classList.remove('hidden');load()}
 async function login(){try{let x=await api('/api/login',{method:'POST',body:JSON.stringify({password:$('#pw').value})});token=x.token;admin=true;$('#login').classList.add('hidden');$('#app').classList.remove('hidden');$('#mode').textContent='管理模式';load()}catch(e){$('#loginmsg').textContent='密码不正确'}}
 document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>{document.querySelectorAll('[data-tab]').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('.tab').forEach(x=>x.classList.add('hidden'));$('#'+b.dataset.tab).classList.remove('hidden');render(b.dataset.tab)});
-async function load(){cache.summary=await api('/api/summary');cache.creators=await api('/api/creators');cache.files=await api('/api/files?limit=100');cache.reviewFiles=await api('/api/review-files');cache.similar=await api('/api/similar');render('home')}
+async function load(){cache.summary=await api('/api/summary');cache.creators=await api('/api/creators');cache.files=await api('/api/files?limit=100');cache.reviewFiles=await api('/api/review-files');cache.similar=await api('/api/similar');api('/api/lan-info').then(x=>{let el=$('#lanAddress');if(el)el.textContent='局域网访问地址：'+(x.urls||[]).join('、')}).catch(()=>{});render('home')}
 function render(tab){if(tab==='home')renderHome();if(tab==='creators')renderCreators();if(tab==='primary')renderPrimary();if(tab==='sources')renderSources();if(tab==='subscriptions')renderSubscriptions();if(tab==='review')renderReview();if(tab==='player')renderPlayer()}
-function renderPrimary(){let j=cache.primaryJob||{};if(!j.job_id&&!j._loaded){cache.primaryJob={_loaded:true};api('/api/primary-latest').then(x=>{cache.primaryJob=x;renderPrimary()}).catch(()=>{});return}let p=Number(j.percent||0);let running=j.status==='运行中';let report=j.summary&&j.summary.report;let execButton=j.status==='完成'&&report?'<button class="dangerbtn" id="primaryApply">执行整理</button>':'';$('#primary').innerHTML='<div class="panel"><h2>主库优先整理</h2><p>以“关注归档”为主库，扫描历史补充来源，重复项先进入虚拟回收站，主库没有的标记为“疑似绝版，待核对”。扫描阶段不会移动文件。</p><button class="primary" id="primaryStart">'+(running?'继续查看扫描':'开始扫描')+'</button> '+execButton+' <button class="dangerbtn" id="recyclePurge">清空虚拟回收站（包括索引）</button><div style="margin-top:16px;background:#e8edf5;border-radius:8px;height:18px;overflow:hidden"><div style="width:'+p+'%;height:100%;background:#315bdc;transition:width .3s"></div></div><p>状态：'+esc(j.status||'未开始')+' · 阶段：'+esc(j.phase||'未开始')+' · '+esc(j.processed||0)+' / '+esc(j.total||0)+' · '+p+'%</p><small>'+esc(j.current||'')+'</small><pre style="white-space:pre-wrap">'+esc(j.summary?JSON.stringify(j.summary,null,2):'')+'</pre></div>';$('#primaryStart').onclick=async()=>{if(running){pollPrimary(j.job_id);return}let r=await api('/api/primary-start',{method:'POST',body:'{}'});cache.primaryJob={job_id:r.job_id,status:'运行中'};renderPrimary();pollPrimary(r.job_id)};let ab=$('#primaryApply');if(ab)ab.onclick=async()=>{if(!confirm('确认执行整理？重复文件将移动到虚拟回收站，疑似绝版将写入索引。'))return;let r=await api('/api/primary-apply',{method:'POST',body:JSON.stringify({report})});cache.primaryJob={job_id:r.job_id,status:'运行中'};renderPrimary();pollPrimary(r.job_id)};let rb=$('#recyclePurge');if(rb)rb.onclick=async()=>{if(!confirm('确认永久删除虚拟回收站内文件并移除对应索引？此操作不可撤销。'))return;let r=await api('/api/recycle-purge',{method:'POST',body:'{}'});cache.primaryJob={job_id:r.job_id,status:'运行中'};renderPrimary();pollPrimary(r.job_id)};if(j.job_id&&!['完成','失败'].includes(j.status))pollPrimary(j.job_id)}
+function renderPrimary(){let j=cache.primaryJob||{};if(!j.job_id&&!j._loaded){cache.primaryJob={_loaded:true};api('/api/primary-latest').then(x=>{cache.primaryJob=x;renderPrimary()}).catch(()=>{});return}let p=Number(j.percent||0);let running=j.status==='运行中';let report=j.summary&&j.summary.report;let execButton=j.status==='完成'&&report?'<button class="dangerbtn" id="primaryApply">执行整理</button>':'';$('#primary').innerHTML='<div class="panel"><h2>主库优先整理</h2><p>以“关注归档”为主库，扫描历史补充来源，重复项先进入虚拟回收站，主库没有的标记为“疑似绝版，待核对”。扫描阶段不会移动文件。</p><button class="primary" id="primaryStart">'+(running?'继续查看扫描':'开始扫描')+'</button> '+execButton+' <button class="dangerbtn" id="recyclePurge">清空虚拟回收站（包括索引）</button><div style="margin-top:16px;background:#e8edf5;border-radius:8px;height:18px;overflow:hidden"><div style="width:'+p+'%;height:100%;background:#315bdc;transition:width .3s"></div></div><p>状态：'+esc(j.status||'未开始')+' · 阶段：'+esc(j.phase||'未开始')+' · '+esc(j.processed||0)+' / '+esc(j.total||0)+' · '+p+'%</p><small>'+esc(j.current||'')+'</small><pre style="white-space:pre-wrap">'+esc(j.summary?JSON.stringify(j.summary,null,2):'')+'</pre></div><div id="primaryIndexPanel"></div>';$('#primaryStart').onclick=async()=>{if(running){pollPrimary(j.job_id);return}let r=await api('/api/primary-start',{method:'POST',body:'{}'});cache.primaryJob={job_id:r.job_id,status:'运行中'};renderPrimary();pollPrimary(r.job_id)};let ab=$('#primaryApply');if(ab)ab.onclick=async()=>{if(!confirm('确认执行整理？重复文件将移动到虚拟回收站，疑似绝版将写入索引。'))return;let r=await api('/api/primary-apply',{method:'POST',body:JSON.stringify({report})});cache.primaryJob={job_id:r.job_id,status:'运行中'};renderPrimary();pollPrimary(r.job_id)};let rb=$('#recyclePurge');if(rb)rb.onclick=async()=>{if(!confirm('确认永久删除虚拟回收站内文件并移除对应索引？此操作不可撤销。'))return;let r=await api('/api/recycle-purge',{method:'POST',body:'{}'});cache.primaryJob={job_id:r.job_id,status:'运行中'};renderPrimary();pollPrimary(r.job_id)};if(j.job_id&&!['完成','失败'].includes(j.status))pollPrimary(j.job_id);renderPrimaryIndex()}
+function renderPrimaryIndex(){let j=cache.primaryIndexJob||{};if(!j._loaded&&!j.job_id){cache.primaryIndexJob={_loaded:true};api('/api/primary-index-latest').then(x=>{cache.primaryIndexJob=x;renderPrimaryIndex();if(x.job_id&&x.status==='运行中'&&!x.needs_resume)pollPrimaryIndex(x.job_id)}).catch(()=>{});return}let p=Number(j.percent||0),running=j.status==='运行中'&&!j.needs_resume;let label=running?'扫描运行中…':j.job_id?'继续扫描':'开始扫描';let stop=running?'<button id="primaryIndexStop">停止扫描</button>':'';let heartbeat=j.updated_at?' · 最近更新 '+esc(j.updated_at):'';let summary=j.summary?'<pre style="white-space:pre-wrap">'+esc(JSON.stringify(j.summary,null,2))+'</pre>':'';$('#primaryIndexPanel').innerHTML='<div class="panel"><h2>扫描并同步主库索引</h2><p>将“关注归档”中的 MP4 和主页作品元数据登记到播放器索引。扫描可暂停后继续，已有记录会自动跳过；不会移动或删除视频。</p><button class="primary" id="primaryIndexStart" '+(running?'disabled':'')+'>'+label+'</button> '+stop+'<div style="margin-top:14px;background:#e8edf5;border-radius:8px;height:16px;overflow:hidden"><div style="width:'+p+'%;height:100%;background:#138a68;transition:width .3s"></div></div><p>状态：'+esc(j.status||'未开始')+' · '+esc(j.phase||'未开始')+' · '+esc(j.processed||0)+' / '+esc(j.total||0)+' · '+p+'% · 新增 '+esc(j.added||j.summary?.added||0)+' 个'+heartbeat+'</p><small>'+esc(j.current||j.error||'')+(j.stale_count?' · 有 '+j.stale_count+' 个旧文件校验信息不一致，已跳过':'')+'</small>'+summary+'</div><div class="panel" id="primaryAuditPanel"><p class="muted">等待索引核对…</p></div>';$('#primaryIndexStart').onclick=async()=>{if(running)return;let r=await api('/api/primary-index-start',{method:'POST',body:'{}'});cache.primaryIndexJob={job_id:r.job_id,status:'运行中'};renderPrimaryIndex();pollPrimaryIndex(r.job_id)};let sb=$('#primaryIndexStop');if(sb)sb.onclick=async()=>{await api('/api/primary-index-stop',{method:'POST',body:JSON.stringify({job_id:j.job_id})});pollPrimaryIndex(j.job_id)};if(!running)renderIndexAudit()}
+async function renderIndexAudit(){let box=$('#primaryAuditPanel');if(!box)return;box.innerHTML='<p class="muted">正在核对主库索引…</p>';try{let a=await api('/api/primary-index-audit');cache.primaryAudit=a;let restore=a.mtime_restore_candidates||0;let missing=a.missing_path_count||0;let sameHash=a.missing_with_existing_hash_count||0;let noCopy=a.missing_without_existing_hash_count||0;let present=a.indexed_present_count??(a.indexed_mp4_count-missing);box.innerHTML='<h3>索引覆盖与异常核对</h3><div class="stats"><div class="stat"><span>磁盘 MP4</span><b>'+a.disk_mp4_count+'</b></div><div class="stat"><span>可用索引 MP4</span><b>'+present+'</b></div><div class="stat"><span>索引记录总数</span><b>'+a.indexed_mp4_count+'</b></div><div class="stat"><span>漏登记</span><b>'+a.unindexed_count+'</b></div><div class="stat"><span>时间变化候选</span><b>'+a.stale_time_only_count+'</b></div><div class="stat"><span>路径不存在</span><b>'+missing+'</b></div><div class="stat"><span>同哈希可核对</span><b>'+sameHash+'</b></div><div class="stat"><span>无现存副本</span><b>'+noCopy+'</b></div><div class="stat"><span>可预览旧时间</span><b>'+restore+'</b></div></div><p class="muted">“索引记录总数”包含已不存在的历史路径；“可用索引 MP4”只统计当前仍在磁盘上的记录。此页只读，不修改数据库和视频。旧时间恢复仍需确认文件哈希，并保存当前时间以便撤回。</p><details><summary>查看异常分类</summary><pre style="white-space:pre-wrap;max-height:320px;overflow:auto">'+esc(JSON.stringify({time_changed:a.stale_examples,missing_paths:a.missing_examples,unindexed:a.unindexed_examples},null,2))+'</pre></details>';attachAuditExport()}catch(e){box.innerHTML='<p class="danger">核对失败：'+esc(e.message||e)+'</p>'}}
+function attachAuditExport(){const box=$('#primaryAuditPanel');if(!box||!cache.primaryAudit||$('#downloadAuditPlan'))return;const b=document.createElement('button');b.id='downloadAuditPlan';b.textContent='下载核对清单';b.title='导出只读核对结果，不修改视频';b.onclick=()=>{const report={created_at:new Date().toISOString(),root:cache.primaryAudit.root,read_only:true,mtime_restore_requires_hash_check:true,mtime_candidates:cache.primaryAudit.stale_examples||[],missing_paths:cache.primaryAudit.missing_examples||[],unindexed:cache.primaryAudit.unindexed_examples||[]};const blob=new Blob([JSON.stringify(report,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='主库索引核对_'+new Date().toISOString().replace(/[:.]/g,'-')+'.json';a.click();URL.revokeObjectURL(a.href)};box.prepend(b);const plan=document.createElement('button');plan.id='createMtimePlan';plan.textContent='生成时间恢复计划';plan.title='只生成计划，不修改文件';plan.onclick=async()=>{plan.disabled=true;plan.textContent='生成中…';try{const x=await api('/api/primary-mtime-plan',{method:'POST',body:'{}'});cache.primaryMtimePlan=x;const note=document.createElement('p');note.className='muted';note.textContent='已生成 '+x.candidate_count+' 个候选，计划编号：'+x.plan_id;box.insertBefore(note,box.firstChild)}catch(e){alert('生成计划失败：'+(e.message||e))}finally{plan.disabled=false;plan.textContent='生成时间恢复计划'}};box.prepend(plan)}
+async function pollPrimaryIndex(id){let r=await api('/api/primary-index-job?job_id='+encodeURIComponent(id));cache.primaryIndexJob=r;renderPrimaryIndex();if(r.status==='运行中'&&!r.needs_resume)setTimeout(()=>pollPrimaryIndex(id),1000)}
 async function pollPrimary(id){let r=await api('/api/primary-job?job_id='+encodeURIComponent(id));cache.primaryJob=r;renderPrimary();if(!['完成','失败'].includes(r.status))setTimeout(()=>pollPrimary(id),1000)}
-function renderSources(){let j=cache.sourceJob||{};let out=j.output||j.message||'';let action='';let batch='';if(j.status==='完成'&&out.includes('batch_id')){let m=out.match(/"batch_id"\s*:\s*"([^"]+)/);if(m){batch=m[1];action='<button class="primary" id="sourceImportButton">确认复制可导入视频</button>'}}$('#sources').innerHTML='<div class="panel"><h2>来源合并</h2><p>输入其他视频目录，先扫描查重，再确认复制到主库待整理区。原目录不会删除。</p><div class="toolbar"><input id="sourcePath" style="min-width:460px" placeholder="例如 E:\\抖音企划\\历史视频"><button class="primary" id="sourceScan">扫描来源</button></div><div id="sourceResult"><p class="muted">状态：'+esc(j.status||'未开始')+'</p><pre style="white-space:pre-wrap">'+esc(out)+'</pre>'+action+'</div></div>';$('#sourceScan').onclick=async()=>{let source=$('#sourcePath').value.trim();if(!source)return alert('请填写来源目录');let r=await api('/api/source-scan',{method:'POST',body:JSON.stringify({source})});cache.sourceJob={job_id:r.job_id,message:'正在扫描…'};renderSources();pollSource(r.job_id)};let ib=$('#sourceImportButton');if(ib)ib.onclick=()=>importSource(batch);if(j.job_id&&!['完成','失败'].includes(j.status))pollSource(j.job_id)}
-async function importSource(batch){if(!confirm('确认复制不重复视频到主库待整理区？'))return;let r=await api('/api/source-import',{method:'POST',body:JSON.stringify({batch})});cache.sourceJob={job_id:r.job_id,message:'正在复制…'};renderSources();pollSource(r.job_id)}
+function renderSources(){let j=cache.sourceJob||{};let out=j.output||j.message||'';let action='';let batch='';if(j.status==='完成'&&out.includes('batch_id')){let m=out.match(/"batch_id"\\s*:\\s*"([^"]+)/);if(m){batch=m[1];action='<button class="primary" id="sourceImportButton">只复制确定不重复项</button> <button class="warn" id="sourceImportSuspectedButton">复核后连同疑似项复制</button><p class="muted">疑似同作品不会默认复制；只有确认来源确实是不同副本或需要保留时，才使用第二个按钮。</p>'}}$('#sources').innerHTML='<div class="panel"><h2>来源合并</h2><p>输入其他视频目录，先扫描查重，再确认复制到主库待整理区。原目录不会删除。</p><div class="toolbar"><input id="sourcePath" style="min-width:460px" placeholder="例如 E:\\抖音企划\\历史视频"><button class="primary" id="sourceScan">扫描来源</button></div><div id="sourceResult"><p class="muted">状态：'+esc(j.status||'未开始')+'</p><pre style="white-space:pre-wrap">'+esc(out)+'</pre>'+action+'</div></div>';$('#sourceScan').onclick=async()=>{let source=$('#sourcePath').value.trim();if(!source)return alert('请填写来源目录');let r=await api('/api/source-scan',{method:'POST',body:JSON.stringify({source})});cache.sourceJob={job_id:r.job_id,message:'正在扫描…'};renderSources();pollSource(r.job_id)};let ib=$('#sourceImportButton');if(ib)ib.onclick=()=>importSource(batch,false);let isb=$('#sourceImportSuspectedButton');if(isb)isb.onclick=()=>importSource(batch,true);if(j.job_id&&!['完成','失败'].includes(j.status))pollSource(j.job_id)}
+async function importSource(batch,acceptSuspected=false){if(!confirm(acceptSuspected?'确认已人工复核疑似同作品项，并复制到待整理区？':'确认只复制确定不重复视频到主库待整理区？'))return;let r=await api('/api/source-import',{method:'POST',body:JSON.stringify({batch,accept_suspected:acceptSuspected})});cache.sourceJob={job_id:r.job_id,message:'正在复制…'};renderSources();pollSource(r.job_id)}
 async function pollSource(id){let r=await api('/api/source-job?job_id='+encodeURIComponent(id));cache.sourceJob=r;renderSources();if(!['完成','失败'].includes(r.status))setTimeout(()=>pollSource(id),1200)}
 function renderHome(){let s=cache.summary;$('#home').innerHTML='<div class="panel"><h2>工作台总览</h2><div class="stats">'+[['可用文件',s.available],['博主身份',s.creators],['作品',s.works],['重复副本',s.duplicates],['相似候选',s.similar],['待确认文件',s.unknown]].map(x=>'<div class="stat">'+x[0]+'<b>'+x[1]+'</b></div>').join('')+'</div></div><div class="panel"><h3>建议顺序</h3><p>先处理博主身份和相似候选，再进入播放器。所有管理动作都要在管理模式确认。</p><button onclick="go(&quot;creators&quot;)">开始博主整理</button> <button onclick="go(&quot;review&quot;)">查看待确认</button></div>'}
 function go(t){document.querySelector('[data-tab="'+t+'"]').click()}
@@ -79,26 +137,6 @@ async function runTask(id){if(!admin)return;let r=await api('/api/run-task',{met
 async function editCreator(id){let name=prompt('输入新的博主名；留空取消');if(!name)return;await api('/api/creator/'+id,{method:'POST',body:JSON.stringify({name})});cache.creators=await api('/api/creators');renderCreators()}
 function renderReview(){let files=cache.reviewFiles||[];let groups={};files.forEach(x=>(groups[x.review_reason]??=[]).push(x));let cards=Object.entries(groups).map(([reason,items])=>'<div class="panel"><h3>'+esc(reason)+'（'+items.length+'）</h3><div class="grid">'+items.slice(0,100).map(x=>'<article class="card"><h3>'+esc(x.title||x.name||'未命名')+'</h3><p>'+esc(x.creator||'博主待确认')+' · '+esc(x.media_status||x.status||'')+'</p><small>'+esc(x.current_path)+'</small></article>').join('')+'</div>'+(items.length>100?'<p class="muted">还有 '+(items.length-100)+' 条，请使用搜索或导出清单。</p>':'')+'</div>').join('');let similarCards=(cache.similar||[]).map(x=>'<div class="card"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px"><article><video controls preload="metadata" style="width:100%;max-height:260px;background:#111" src="/media?path='+encodeURIComponent(x.path_a||'')+'"></video><h3>A：'+esc(x.title_a||'未命名')+'</h3><p>'+esc(x.creator_a||'博主待确认')+'</p><small>'+esc(x.path_a||'路径不存在')+'</small></article><article><video controls preload="metadata" style="width:100%;max-height:260px;background:#111" src="/media?path='+encodeURIComponent(x.path_b||'')+'"></video><h3>B：'+esc(x.title_b||'未命名')+'</h3><p>'+esc(x.creator_b||'博主待确认')+'</p><small>'+esc(x.path_b||'路径不存在')+'</small></article></div><p>'+esc(x.reason)+' · 参考值 '+x.score+' · 当前：'+esc(x.decision||'待确认')+'</p><button class="similarReview" data-a="'+esc(x.a)+'" data-b="'+esc(x.b)+'" data-decision="同一作品的不同版本">同一作品版本</button> <button class="similarReview" data-a="'+esc(x.a)+'" data-b="'+esc(x.b)+'" data-decision="不同作品">不同作品</button> <button class="similarReview" data-a="'+esc(x.a)+'" data-b="'+esc(x.b)+'" data-decision="暂不确定">暂不确定</button></div>').join('');$('#review').innerHTML='<div class="panel"><h2>待确认与异常</h2><p>这里只显示确实需要补资料、核对或检查的记录，共 '+files.length+' 条。</p></div>'+cards+'<div class="panel"><h2>相似候选</h2><p>左右播放抽样视频进行对比，共 '+similarCards.length+' 组。</p>'+similarCards+'</div>';document.querySelectorAll('.similarReview').forEach(b=>b.onclick=()=>review(b.dataset.a,b.dataset.b,b.dataset.decision))}
 async function review(a,b,decision){if(!admin){alert('请先进入管理模式');return}await api('/api/review',{method:'POST',body:JSON.stringify({a,b,decision})});cache.similar=await api('/api/similar');renderReview()}
-let feed=[],feedIndex=0,currentVideo=null,mode='recommend',sessionMode='test',tempBlockedVideos=new Set(),tempBlockedCreators=new Set(),preloadedVideos=new Map(),clickTimer=null;
-function renderPlayer(){
- $('#player').innerHTML='<div class="playerShell"><div class="playerTop"><select id="feedMode"><option value="recommend">推荐</option><option value="creator">博主轮播</option><option value="random">随机探索</option></select><button id="fullscreenButton" title="全屏">⛶</button><button id="modeButton">管理/测试模式</button><span id="reason"></span></div><div id="modeNotice" class="modeNotice">管理/测试模式：不会影响真实推荐</div><div id="feedViewport" class="feedViewport" tabindex="0"></div><div class="playerHelp">↑↓ / 滚轮切换　双击喜欢　←返回　空格暂停</div></div>';
- $('#feedMode').value=mode;$('#feedMode').onchange=()=>{mode=$('#feedMode').value;startFeed()};$('#modeButton').onclick=toggleRealMode;$('#fullscreenButton').onclick=toggleFullscreen;
- let vp=$('#feedViewport');vp.onwheel=e=>{e.preventDefault();step(e.deltaY>0?1:-1)};vp.onkeydown=e=>{if(e.key==='ArrowDown')step(1);if(e.key==='ArrowUp')step(-1);if(e.key===' '){e.preventDefault();let v=vp.querySelector('video');if(v)v.paused?v.play():v.pause()}};
- let startY=0,startT=0,swiping=false;vp.ontouchstart=e=>{startY=e.touches[0].clientY;startT=Date.now();swiping=false};vp.ontouchmove=e=>{if(Math.abs(e.touches[0].clientY-startY)>12)swiping=true};vp.ontouchend=e=>{let d=startY-e.changedTouches[0].clientY,dt=Date.now()-startT;if(swiping&&Math.abs(d)>Math.max(48,window.innerHeight*.12)&&dt<700)step(d>0?1:-1)};
- startFeed();
-}
-async function startFeed(){try{for(let v of preloadedVideos.values())v.src='';preloadedVideos.clear();feed=await api('/api/feed?mode='+mode);feed=filterTemp(feed);feedIndex=0;showFeed()}catch(e){$('#feedViewport').innerHTML='<p class="danger">推荐流加载失败：'+esc(e.message)+'</p>'}}
-function filterTemp(list){return list.filter(x=>!tempBlockedVideos.has(x.file_id)&&!tempBlockedCreators.has(x.creator_id))}
-function syncFullscreen(){let shell=document.querySelector('.playerShell');if(!shell)return;let active=document.fullscreenElement===shell||shell.classList.contains('immersive');shell.classList.toggle('immersive',active&&!document.fullscreenElement);$('#fullscreenButton').textContent=active?'×':'⛶';$('#fullscreenButton').title=active?'退出全屏':'全屏'}
-document.addEventListener('fullscreenchange',syncFullscreen);
-function toggleFullscreen(){let shell=document.querySelector('.playerShell');if(!shell)return;if(document.fullscreenElement||shell.classList.contains('immersive')){if(document.fullscreenElement&&document.exitFullscreen)document.exitFullscreen().catch(()=>{});shell.classList.remove('immersive');syncFullscreen();document.body.style.overflow='';return}document.body.style.overflow='hidden';if(shell.requestFullscreen){shell.requestFullscreen().then(syncFullscreen).catch(()=>{shell.classList.add('immersive');syncFullscreen()})}else{shell.classList.add('immersive');syncFullscreen()}}
-function toggleRealMode(){if(sessionMode==='real'){sessionMode='test';$('#modeButton').textContent='管理/测试模式';$('#modeNotice').textContent='管理/测试模式：不会影响真实推荐';$('#modeNotice').className='modeNotice';return}if(!confirm('进入真实推荐模式后，观看、喜欢、跳过和屏蔽会影响推荐结果。确定进入？'))return;sessionMode='real';$('#modeButton').textContent='真实推荐模式';$('#modeNotice').textContent='真实推荐模式：行为会影响推荐';$('#modeNotice').className='modeNotice real'}
-function showFeed(){let x=feed[feedIndex];if(!x){$('#feedViewport').innerHTML='<p>没有符合条件的视频。</p>';return}currentVideo=x;let vp=$('#feedViewport');vp.innerHTML='<video id="activeVideo" playsinline muted preload="auto"></video><div class="videoOverlay"><h2>'+esc(x.title||'未命名')+'</h2><p>@'+esc(x.creator||'博主待确认')+' · '+(x.duration||'')+' 秒</p><p class="why">'+esc(x.reason||'来自本地视频库')+'</p><div class="actions"><button id="likeBtn">♡ 喜欢</button><button id="blockVideo">不喜欢此视频</button><button id="blockCreator">不喜欢此博主</button><button id="nextBtn">下一个</button></div></div>';let v=$('#activeVideo'),warm=preloadedVideos.get(feedIndex);if(warm){preloadedVideos.delete(feedIndex);warm.id='activeVideo';warm.playsInline=true;v.replaceWith(warm);v=warm}else{v.src='/media?path='+encodeURIComponent(x.current_path)}v.muted=localStorage.getItem('muted')==='1';v.onplay=()=>sendEvent('play_start');v.ontimeupdate=()=>{if(v.currentTime>3&&!x.counted){x.counted=true;sendEvent('watch_start',{watch_ms:Math.round(v.currentTime*1000)})}};v.onended=()=>{sendEvent('complete',{watch_ms:Math.round(v.duration*1000)});step(1)};v.play().catch(()=>{});vp.onclick=e=>{if(e.target.closest('button'))return;clearTimeout(clickTimer);clickTimer=setTimeout(()=>{let active=$('#activeVideo');if(active)active.paused?active.play().catch(()=>{}):active.pause()},220)};vp.ondblclick=e=>{if(e.target.closest('button'))return;clearTimeout(clickTimer);sendEvent('like');$('#likeBtn').textContent='♥ 已喜欢';showHeart()};$('#likeBtn').onclick=()=>sendEvent('like');$('#blockVideo').onclick=()=>block('video');$('#blockCreator').onclick=()=>block('creator');$('#nextBtn').onclick=()=>step(1);$('#reason').textContent=x.reason||'';preload(1);preload(-1)}
-function showHeart(){let h=document.createElement('div');h.textContent='♥';h.style='position:absolute;left:50%;top:42%;font-size:90px;color:#ff3b6b;transform:translate(-50%,-50%);animation:heart .55s ease-out forwards;pointer-events:none';$('#feedViewport').appendChild(h);setTimeout(()=>h.remove(),650)}
-let lastStepAt=0;function step(delta){if(!feed.length||Date.now()-lastStepAt<260)return;lastStepAt=Date.now();let v=$('#activeVideo');if(v)sendEvent(delta>0?'skip':'rewind',{watch_ms:Math.round((v.currentTime||0)*1000)});feedIndex=Math.max(0,Math.min(feed.length-1,feedIndex+delta));showFeed()}
-function preload(d){let i=feedIndex+d,x=feed[i];if(!x||preloadedVideos.has(i))return;let v=document.createElement('video');v.preload=d>0?'auto':'metadata';v.muted=true;v.src='/media?path='+encodeURIComponent(x.current_path);v.load();preloadedVideos.set(i,v);if(preloadedVideos.size>4){let old=[...preloadedVideos.keys()].sort((a,b)=>Math.abs(a-feedIndex)-Math.abs(b-feedIndex)).pop();let stale=preloadedVideos.get(old);stale.src='';preloadedVideos.delete(old)}}
-async function sendEvent(event_type,extra={}){if(!currentVideo||sessionMode!=='real')return;try{await api('/api/event',{method:'POST',body:JSON.stringify({file_id:currentVideo.file_id,work_id:currentVideo.work_id,event_type,watch_ms:extra.watch_ms||0,mode:sessionMode,extra})})}catch(e){}}
-async function block(kind){if(!currentVideo)return;let label=kind==='creator'?'这个博主的全部视频':'这个视频';if(!confirm('以后不再推荐'+label+'？'))return;if(kind==='creator')tempBlockedCreators.add(currentVideo.creator_id);else tempBlockedVideos.add(currentVideo.file_id);await sendEvent(kind==='creator'?'block_creator':'block_video');feed=filterTemp(await api('/api/feed?mode='+mode));feedIndex=Math.min(feedIndex,Math.max(0,feed.length-1));showFeed()}
 load().catch(()=>{});
 </script></html>'''
 
@@ -111,6 +149,15 @@ class Handler(BaseHTTPRequestHandler):
     def admin(self): return True
     def do_GET(self):
         u=urlparse(self.path)
+        if u.path=='/api/lan-info':
+            self.send_json({'host':socket.gethostname(),'urls':lan_urls()}); return
+        if u.path=='/api/downloader-status':
+            try:
+                with socket.create_connection(('127.0.0.1',DOWNLOADER_PORT),timeout=0.5):
+                    online=True
+            except OSError:
+                online=False
+            self.send_json({'online':online,'port':DOWNLOADER_PORT}); return
         if u.path.startswith('/player'):
             rel=u.path.removeprefix('/player').lstrip('/') or 'index.html'
             player_root=(BASE/'整理工具'/'player-web'/'dist').resolve()
@@ -142,11 +189,84 @@ class Handler(BaseHTTPRequestHandler):
                 if files:
                     latest=json.loads(files[0].read_text(encoding='utf-8')); latest['job_id']=files[0].stem
             self.send_json(latest or {'status':'未开始'}); return
+        if u.path=='/api/primary-index-job':
+            job_id=parse_qs(u.query).get('job_id',[''])[0]; live=JOBS.get(job_id,{}); job=dict(live)
+            if not job:
+                pp=primary_job_file(job_id)
+                if pp:
+                    job={'job_id':job_id,'kind':'primary-index','progress':str(pp),'stop_file':str(pp.with_suffix(pp.suffix+'.stop'))}
+            pp=Path(job.get('progress','')) if job.get('progress') else None
+            if pp and pp.exists():
+                try: job.update(json.loads(pp.read_text(encoding='utf-8')))
+                except Exception: pass
+            job=primary_runtime_state(job)
+            self.send_json(job or {'job_id':job_id,'status':'未启动'}); return
+        if u.path=='/api/primary-index-latest':
+            jobs_dir=LIB/'索引'/'主库优先整理'/'jobs'; latest=None
+            if jobs_dir.exists():
+                files=sorted(jobs_dir.glob('primaryindex_*.json'),key=lambda p:p.stat().st_mtime,reverse=True)
+                if files:
+                    latest=json.loads(files[0].read_text(encoding='utf-8')); latest['job_id']=files[0].stem
+                    latest=primary_runtime_state(latest)
+            self.send_json(latest or {'status':'未开始'}); return
+        if u.path=='/api/primary-index-audit':
+            # 只读审计：不写 SQLite、不改文件，用于解释时间变化和孤立路径。
+            root=LIB/'关注归档'
+            if not root.is_dir(): self.send_json({'error':'主库目录不存在'},404); return
+            try:
+                audit_db=sqlite3.connect(f'file:{DB.as_posix()}?mode=ro', uri=True)
+                audit_db.row_factory=sqlite3.Row
+                indexed={r['current_path']:dict(r) for r in audit_db.execute(
+                    "select id,current_path,size,mtime_ns,sha256,status,library_role,work_id,creator_id from files where current_path like ? and lower(current_path) like '%.mp4'", (str(root)+'%',))}
+            finally:
+                try: audit_db.close()
+                except Exception: pass
+            disk_paths={str(x):x for x in root.rglob('*.mp4') if x.is_file()}
+            missing=[]; stale=[]; unindexed=[]
+            for path in disk_paths.values():
+                row=indexed.get(str(path))
+                if not row:
+                    unindexed.append(str(path)); continue
+                try: stat=path.stat()
+                except OSError: continue
+                if row.get('size')!=stat.st_size or row.get('mtime_ns')!=stat.st_mtime_ns:
+                    stale.append({'file_id':row['id'],'path':str(path),'indexed_mtime_ns':row.get('mtime_ns'),'current_mtime_ns':stat.st_mtime_ns,'indexed_size':row.get('size'),'current_size':stat.st_size,'time_only':row.get('size')==stat.st_size,'sha256':row.get('sha256')})
+            existing_hashes={}
+            for path,row in indexed.items():
+                if path in disk_paths and row.get('sha256'):
+                    existing_hashes.setdefault(row['sha256'],[]).append(path)
+            for path,row in indexed.items():
+                if path not in disk_paths:
+                    peers=existing_hashes.get(row.get('sha256'),[])
+                    missing.append({'file_id':row['id'],'path':path,'sha256':row.get('sha256'),'work_id':row.get('work_id'),'creator_id':row.get('creator_id'),'same_hash_paths':peers[:8],'same_hash_count':len(peers)})
+            same_hash_missing=sum(1 for x in missing if x['same_hash_count'])
+            self.send_json({'root':str(root),'disk_mp4_count':len(disk_paths),'indexed_mp4_count':len(indexed),'indexed_present_count':len(indexed)-len(missing),'unindexed_count':len(unindexed),'stale_count':len(stale),'stale_time_only_count':sum(1 for x in stale if x['time_only']),'missing_path_count':len(missing),'missing_with_existing_hash_count':same_hash_missing,'missing_without_existing_hash_count':len(missing)-same_hash_missing,'mtime_restore_candidates':sum(1 for x in stale if x['time_only']),'unindexed_examples':unindexed[:20],'stale_examples':stale[:100],'missing_examples':missing[:100],'read_only':True}); return
         c=db()
         try:
             if u.path=='/api/summary':
                 x=c.execute("select count(*) n from files where status!='已永久删除'").fetchone()['n']; self.send_json({'available':x,'creators':c.execute('select count(*) n from creators').fetchone()['n'],'works':c.execute('select count(*) n from works').fetchone()['n'],'duplicates':c.execute("select count(*) n from files where duplicate_of is not null and status!='已永久删除'").fetchone()['n'],'similar':c.execute('select count(*) n from similar').fetchone()['n'],'unknown':c.execute("select count(*) n from files where creator_id is null and status!='已永久删除'").fetchone()['n']}); return
             if u.path=='/api/creators': self.send_json(rows(c,"select c.id,c.name,c.platform_id,c.identity_status,coalesce(c.aliases_json,'[]') aliases_json,count(f.id) file_count,sum(case when f.kind='video' then 1 else 0 end) video_count,sum(case when f.kind='image' then 1 else 0 end) image_count from creators c left join files f on f.creator_id=c.id and f.status!='已永久删除' group by c.id order by case when c.identity_status like '已合并到%' then 1 else 0 end,file_count desc,c.name")); return
+            if u.path=='/api/following':
+                query=parse_qs(u.query); term=query.get('q',[''])[0].strip(); args=[]; where=''
+                if term:
+                    where='where c.name like ? or c.id like ? or c.platform_id like ? or c.aliases_json like ?'
+                    pattern='%'+term+'%'; args=[pattern,pattern,pattern,pattern]
+                elif query.get('following',['0'])[0]=='1': where='where pf.creator_id is not null'
+                self.send_json(rows(c,f'''select c.id creator_id,c.name,c.platform_id,c.aliases_json,
+                    count(distinct case when f.kind='video' and f.status!='已永久删除' and f.duplicate_of is null then f.work_id end) video_count,
+                    max(pf.followed_at) followed_at,case when pf.creator_id is null then 0 else 1 end is_following
+                    from creators c left join files f on f.creator_id=c.id left join player_follows pf on pf.creator_id=c.id
+                    {where} group by c.id order by is_following desc,video_count desc,c.name limit 200''',args)); return
+            if u.path=='/api/creator-videos':
+                query=parse_qs(u.query); cid=query.get('creator_id',[''])[0]; page=max(0,int(query.get('page',['0'])[0] or 0)); limit=min(60,max(12,int(query.get('limit',['36'])[0] or 36)))
+                self.send_json(rows(c,'''with likes as (select work_id,max(value) like_count from metrics where metric='点赞量' group by work_id)
+                    select f.id file_id,f.work_id,f.creator_id,f.current_path,f.library_role,f.video_label,
+                    w.title,coalesce(cr.name,'博主待确认') creator,m.duration,l.like_count,
+                    case when l.like_count is not null then '历史点赞量' else '无点赞记录' end like_source
+                    from files f join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
+                    left join likes l on l.work_id=f.work_id
+                    where f.creator_id=? and f.kind='video' and f.status!='已永久删除' and f.duplicate_of is null
+                    order by like_count is null,like_count desc,w.published_at desc,f.id limit ? offset ?''',(cid,limit,page*limit))); return
             if u.path=='/api/creator-candidates':
                 items=rows(c,"select c.id,c.name,count(f.id) file_count from creators c left join files f on f.creator_id=c.id and f.status!='已永久删除' group by c.id")
                 groups={}
@@ -159,12 +279,26 @@ class Handler(BaseHTTPRequestHandler):
                 case when f.creator_id is null then '博主未确认' when f.kind='image' and f.work_id is null then '图片未关联作品' when m.status in ('下载未完成','图片异常','无法抽帧','检查失败','解码有告警','仅音频，扩展名为MP4') then '媒体检查异常' when f.video_label='疑似绝版，待核对' then '疑似绝版，待核对' else '待补资料' end review_reason
                 from files f left join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
                 where f.status!='已永久删除' and (f.creator_id is null or (f.kind='image' and f.work_id is null) or m.status in ('下载未完成','图片异常','无法抽帧','检查失败','解码有告警','仅音频，扩展名为MP4') or f.video_label='疑似绝版，待核对') order by f.id desc limit 20000""")); return
-            if u.path=='/api/favorites':
-                self.send_json(rows(c,"""select f.id file_id,f.current_path,w.title,coalesce(cr.name,'博主待确认') creator,m.duration
-                    from files f left join works w on w.id=f.work_id left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
-                    where exists(select 1 from feedback a where a.event_type='favorite' and json_extract(a.extra_json,'$.file_id')=f.id
-                      and not exists(select 1 from feedback b where b.event_type='unfavorite' and json_extract(b.extra_json,'$.file_id')=f.id and b.rowid>a.rowid))
-                    order by f.id desc limit 500""")); return
+            if u.path in ('/api/favorites','/api/collections'):
+                kind=parse_qs(u.query).get('type',['favorite'])[0] if u.path=='/api/collections' else 'favorite'
+                if kind not in ('like','favorite'): kind='favorite'
+                off='unlike' if kind=='like' else 'unfavorite'
+                self.send_json(rows(c,f"""with active as (
+                    select json_extract(a.extra_json,'$.file_id') file_id,max(a.rowid) event_rowid
+                    from feedback a where a.event_type=? and json_extract(a.extra_json,'$.file_id') is not null
+                    group by json_extract(a.extra_json,'$.file_id')),
+                    preferred as (select f.*,row_number() over(partition by f.work_id order by case when coalesce(f.library_role,'')='主库' then 0 else 1 end,f.current_path) rn
+                      from files f where f.status!='已永久删除' and f.kind='video' and f.duplicate_of is null)
+                    select f.id file_id,f.work_id,f.creator_id,f.current_path,f.library_role,f.video_label,w.title,
+                      coalesce(cr.name,'博主待确认') creator,m.duration
+                    from active a join preferred f on f.id=a.file_id and f.rn=1 left join works w on w.id=f.work_id
+                      left join creators cr on cr.id=f.creator_id left join media m on m.file_id=f.id
+                    where 1=1
+                      and not exists(select 1 from feedback b where b.event_type=? and json_extract(b.extra_json,'$.file_id')=f.id and b.rowid>a.event_rowid)
+                    order by a.event_rowid desc limit 5000""",(kind,off))); return
+            if u.path=='/api/history-status':
+                imports=rows(c,'select * from history_imports order by imported_at desc') if c.execute("select count(*) from sqlite_master where type='table' and name='history_imports'").fetchone()[0] else []
+                self.send_json({'imports':imports,'matched':sum(x['matched_count'] for x in imports),'unmatched_deleted':sum(x['unmatched_count'] for x in imports)}); return
             if u.path=='/api/feed':
                 query=parse_qs(u.query); mode=query.get('mode',['recommend'])[0]; source=query.get('source',['primary'])[0]; creator_id=query.get('creator_id',[''])[0]
                 page=max(0,int(parse_qs(u.query).get('page',['0'])[0] or 0))
@@ -207,7 +341,7 @@ class Handler(BaseHTTPRequestHandler):
                     if start>=size or start>end: self.send_response(416); self.send_header('Content-Range',f'bytes */{size}'); self.end_headers(); return
                     end=min(end,size-1); self.send_response(206); self.send_header('Content-Range',f'bytes {start}-{end}/{size}')
                 else: self.send_response(200)
-                length=end-start+1; self.send_header('Accept-Ranges','bytes'); self.send_header('Content-Type','video/mp4'); self.send_header('Content-Length',str(length)); self.end_headers()
+                length=end-start+1; self.send_header('Accept-Ranges','bytes'); self.send_header('Content-Type','video/mp4'); self.send_header('Cache-Control','public, max-age=3600'); self.send_header('Content-Length',str(length)); self.end_headers()
                 with p.open('rb') as f:
                     f.seek(start); remaining=length
                     while remaining:
@@ -235,7 +369,34 @@ class Handler(BaseHTTPRequestHandler):
                 c.execute('insert into feedback(id,work_id,event_at,event_type,watch_ms,session_id,recommender_version,extra_json) values(?,?,?,?,?,?,?,?)',(uuid.uuid4().hex,fr['work_id'],datetime.datetime.now().astimezone().isoformat(timespec='seconds'),data.get('event_type','play_start'),int(data.get('watch_ms') or 0),self.headers.get('X-Session','local'), 'feed-v1',json.dumps(extra,ensure_ascii=False)))
                 c.commit(); self.send_json({'ok':True}); return
             finally: c.close()
+        if u.path=='/api/history-import':
+            script=Path(__file__).with_name('导入历史反馈.py'); py=os.environ.get('DOUYIN_PYTHON',sys.executable)
+            try:
+                p=subprocess.run([py,str(script)],cwd=str(BASE),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=180)
+                if p.returncode: self.send_json({'error':(p.stderr or p.stdout)[-4000:]},500); return
+                self.send_json({'ok':True,'result':json.loads(p.stdout)}); return
+            except Exception as e: self.send_json({'error':str(e)},500); return
+        if u.path=='/api/follow':
+            c=db()
+            try:
+                creator_id=str(data.get('creator_id') or '')
+                if not c.execute('select 1 from creators where id=?',(creator_id,)).fetchone(): self.send_json({'error':'博主不存在'},404); return
+                if data.get('follow'):
+                    c.execute('insert or ignore into player_follows(creator_id,followed_at) values(?,?)',(creator_id,time.strftime('%Y-%m-%dT%H:%M:%S%z')))
+                else:
+                    c.execute('delete from player_follows where creator_id=?',(creator_id,))
+                c.commit(); self.send_json({'ok':True,'following':bool(data.get('follow'))}); return
+            finally: c.close()
         if not self.admin(): self.send_json({'error':'需要管理权限'},403); return
+        if u.path=='/api/primary-mtime-plan':
+            script=Path(__file__).with_name('恢复主库时间.py'); py=os.environ.get('DOUYIN_PYTHON',sys.executable)
+            try:
+                p=subprocess.run([py,str(script)],cwd=str(BASE),capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=180)
+                if p.returncode:
+                    self.send_json({'error':(p.stderr or p.stdout)[-4000:]},500); return
+                self.send_json(json.loads(p.stdout)); return
+            except Exception as exc:
+                self.send_json({'error':str(exc)},500); return
         if u.path in ('/api/source-scan','/api/source-import'):
             import uuid
             job_id='sourcejob_'+uuid.uuid4().hex[:10]; script=Path(__file__).with_name('来源合并工具.py'); py=os.environ.get('DOUYIN_PYTHON',sys.executable)
@@ -265,6 +426,51 @@ class Handler(BaseHTTPRequestHandler):
                     JOBS[job_id].update(status='完成' if p.returncode==0 else '失败',output=(p.stdout or p.stderr)[-8000:])
                 except Exception as e: JOBS[job_id].update(status='失败',output=str(e))
             threading.Thread(target=run_primary,daemon=True).start(); self.send_json({'ok':True,'job_id':job_id}); return
+        if u.path=='/api/primary-index-start':
+            active=next((x for x in JOBS.values() if x.get('kind')=='primary-index' and x.get('status')=='运行中'),None)
+            if active: self.send_json({'ok':True,'job_id':active['job_id'],'message':'主库索引扫描已经在运行'}); return
+            jobs_dir=LIB/'索引'/'主库优先整理'/'jobs'
+            if jobs_dir.exists():
+                for candidate in sorted(jobs_dir.glob('primaryindex_*.json'), key=lambda p:p.stat().st_mtime, reverse=True):
+                    try: saved=json.loads(candidate.read_text(encoding='utf-8'))
+                    except Exception: continue
+                    saved=primary_runtime_state(saved)
+                    if saved.get('status')=='运行中' and saved.get('worker_alive'):
+                        job_id=candidate.stem
+                        JOBS[job_id]={'job_id':job_id,'kind':'primary-index','status':'运行中','progress':str(candidate),'stop_file':str(candidate.with_suffix(candidate.suffix+'.stop'))}
+                        self.send_json({'ok':True,'job_id':job_id,'message':'主库索引扫描已在运行，已接管任务'}); return
+            import uuid
+            job_id='primaryindex_'+uuid.uuid4().hex[:10]
+            progress=LIB/'索引'/'主库优先整理'/'jobs'/f'{job_id}.json'
+            stop_file=progress.with_suffix(progress.suffix+'.stop')
+            stop_file.unlink(missing_ok=True)
+            script=Path(__file__).with_name('扫描主库索引.py')
+            py=os.environ.get('DOUYIN_PYTHON',sys.executable)
+            JOBS[job_id]={'job_id':job_id,'kind':'primary-index','status':'运行中','progress':str(progress),'stop_file':str(stop_file)}
+            def index_primary():
+                try:
+                    p=subprocess.Popen([py,str(script),'--progress',str(progress),'--stop-file',str(stop_file)],cwd=str(BASE),stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,encoding='utf-8',errors='replace')
+                    JOBS[job_id]['worker_pid']=p.pid
+                    output,_=p.communicate()
+                    JOBS[job_id].update(status='完成' if p.returncode==0 else '失败',output=(output or '')[-8000:],worker_pid=p.pid)
+                except Exception as e:
+                    JOBS[job_id].update(status='失败',output=str(e))
+            threading.Thread(target=index_primary,daemon=True).start()
+            self.send_json({'ok':True,'job_id':job_id}); return
+        if u.path=='/api/primary-index-stop':
+            job_id=str(data.get('job_id') or ''); job=JOBS.get(job_id)
+            if not job:
+                pp=primary_job_file(job_id)
+                if pp:
+                    try: saved=json.loads(pp.read_text(encoding='utf-8'))
+                    except Exception: saved={}
+                    saved=primary_runtime_state(saved)
+                    if saved.get('status')=='运行中':
+                        job={'job_id':job_id,'kind':'primary-index','status':'运行中','progress':str(pp),'stop_file':str(pp.with_suffix(pp.suffix+'.stop'))}
+            if not job or job.get('kind')!='primary-index' or job.get('status')!='运行中':
+                self.send_json({'error':'扫描任务当前没有运行'},409); return
+            stop_file=Path(job['stop_file']); stop_file.parent.mkdir(parents=True,exist_ok=True); stop_file.write_text('stop',encoding='utf-8')
+            self.send_json({'ok':True,'message':'已请求停止，扫描器会保存已完成部分'}); return
         if u.path=='/api/primary-apply':
             import uuid
             report=Path(str(data.get('report') or '')).resolve(); allowed=(LIB/'索引'/'主库优先整理').resolve()
@@ -341,6 +547,11 @@ if __name__=='__main__':
     print(f'局域网地址: http://<本机IP>:{PORT}')
     print('管理密码已写入:', CONFIG)
     ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
+
+
+
+
+
 
 
 
